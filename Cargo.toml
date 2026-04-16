@@ -1,0 +1,43 @@
+[package]
+name = "stalwart-cli"
+description = "Stalwart CLI"
+version = "1.0.0"
+authors = ["Stalwart Labs LLC <hello@stalw.art>"]
+license = "AGPL-3.0-only OR LicenseRef-SEL"
+repository = "https://github.com/stalwartlabs/cli"
+homepage = "https://github.com/stalwartlabs/cli"
+edition = "2024"
+readme = "README.md"
+
+[package.metadata.wix]
+upgrade-guid = "A23CF3C0-DD43-4575-9794-DD1EC6051C6F"
+path-guid = "571AF523-511D-45E0-BB08-41A038672DE2"
+license = false
+eula = false
+
+[dependencies]
+ahash = { version = "0.8.3", features = ["serde"] }
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "5"
+flate2 = "1"
+is-terminal = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "rustls-native-certs", "json"] }
+rpassword = "7"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+sha2 = "0.10"
+thiserror = "1"
+
+[[bin]]
+name = "stalwart-cli"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
