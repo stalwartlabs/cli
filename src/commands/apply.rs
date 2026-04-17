@@ -336,7 +336,6 @@ impl Summary {
     }
 }
 
-/// Collect all `#id` references in a value tree (string values and object keys).
 fn collect_refs(value: &Value, out: &mut HashSet<String>) {
     match value {
         Value::String(s) => {
@@ -365,9 +364,6 @@ fn collect_refs(value: &Value, out: &mut HashSet<String>) {
     }
 }
 
-/// Build a per-request `createdIds` map: the subset of known created ids
-/// referenced by this request. Excludes ids being created in this very request
-/// (those resolve locally within the JMAP `create` context).
 fn request_created_ids(
     refs: &HashSet<String>,
     state_ids: &HashMap<String, String>,

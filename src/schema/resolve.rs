@@ -210,10 +210,5 @@ mod tests {
         assert_eq!(display_name("Mailbox"), "Mailbox");
     }
 
-    #[allow(dead_code)]
-    fn _suppress_unused(schema: &Schema) -> Option<&str> {
-        resolve_enum(schema, "foo")
-    }
-
     fn _keep_hashmap_used(_h: HashMap<String, String>) {}
 }

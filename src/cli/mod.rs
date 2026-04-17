@@ -70,6 +70,8 @@ pub enum Command {
     Describe(DescribeArgs),
     /// Apply a bulk plan of creates, updates, and destroys from a JSON file
     Apply(ApplyArgs),
+    /// Snapshot one or more object types into a plan file consumable by `apply`
+    Snapshot(SnapshotArgs),
 }
 
 #[derive(Args, Debug)]
@@ -186,4 +188,35 @@ pub struct ApplyArgs {
     /// Print per-batch progress during large destroys and creates
     #[arg(long)]
     pub progress: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotArgs {
+    /// Object types to include (positional, at least one). Use bare object
+    /// names (`Domain`, `Account`, ...). For multi-variant types, all variants
+    /// are included. View / variant slash forms are rejected.
+    #[arg(required = true, value_name = "OBJECT")]
+    pub objects: Vec<String>,
+
+    /// Write the plan to this path instead of stdout
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Skip the destroy block at the top of the plan
+    #[arg(long)]
+    pub no_destroys: bool,
+
+    /// Include secret field values as returned by the server (default: strip)
+    #[arg(long)]
+    pub include_secrets: bool,
+
+    /// Comma-separated types whose references may be left unresolved. Any
+    /// reference to one of these types found in the data is dropped from the
+    /// exported plan.
+    #[arg(long, value_name = "TYPES", value_delimiter = ',')]
+    pub allow_unresolved: Vec<String>,
+
+    /// Suppress progress output on stderr
+    #[arg(long)]
+    pub quiet: bool,
 }

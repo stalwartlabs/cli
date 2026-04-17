@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// URL-safe base64 (no padding) of sha256 of the input.
 pub fn hash_b64(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     URL_SAFE_NO_PAD.encode(digest)

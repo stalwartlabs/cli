@@ -41,6 +41,7 @@ The tool fetches the server's schema on first use and derives every command, val
 | `get` / `query` | Fetch a single object or list / filter many. |
 | `create` / `update` / `delete` | Single-object mutations. |
 | `apply` | Apply a JSON plan of bulk creates, updates, and destroys (intended for Ansible, Terraform, NixOS, Pulumi, and CI/CD pipelines). |
+| `snapshot` | Export live server state as an `apply`-ready JSON plan. Useful for backups, cross-environment promotion, and round-trip disaster-recovery rehearsals. |
 
 Output is human-friendly by default (sectioned, with color when stdout is a TTY) and switches to compact JSON or NDJSON for machine consumption.
 
@@ -81,6 +82,8 @@ stalwart-cli create domain --field name=example.com --field isEnabled=true
 stalwart-cli update domain <id> --field description='Primary'
 stalwart-cli delete domain --ids <id>
 stalwart-cli apply --file plan.json         # bulk apply
+stalwart-cli snapshot Tenant Domain \        # export state as an apply plan
+    --output backup.json
 ```
 
 ## Documentation

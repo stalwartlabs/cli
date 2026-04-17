@@ -10,6 +10,7 @@ pub mod delete;
 pub mod describe;
 pub mod get;
 pub mod query;
+pub mod snapshot;
 pub mod update;
 
 use crate::app::context::Context;
@@ -25,5 +26,6 @@ pub fn dispatch(ctx: Context, cmd: Command) -> CliResult<()> {
         Command::Update(args) => update::run(&ctx, &args),
         Command::Delete(args) => delete::run(&ctx, &args),
         Command::Apply(args) => apply::run(&ctx, &args),
+        Command::Snapshot(args) => snapshot::run(&ctx, &args),
     }
 }
