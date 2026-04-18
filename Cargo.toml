@@ -41,6 +41,3 @@ strip = "symbols"
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-[package.metadata.dist]
-allow-dirty = ["ci"]

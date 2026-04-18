@@ -20,3 +20,5 @@ publish-jobs = ["homebrew"]
 # Whether to install an updater program
 install-updater = false
 github-attestations = true
+# Allow dist to ignore drift in CI-owned files (e.g. customized release.yml)
+allow-dirty = ["ci"]
