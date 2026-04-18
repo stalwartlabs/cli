@@ -217,8 +217,8 @@ fn topologically_sort(schema: &Schema, shards: &mut Vec<Shard>) -> CliResult<()>
 
     while let Some(i) = ready.pop() {
         order.push(i);
-        for j in 0..n {
-            if deps[j].remove(&i) && deps[j].is_empty() {
+        for (j, dep) in deps.iter_mut().enumerate() {
+            if dep.remove(&i) && dep.is_empty() {
                 ready.push(j);
             }
         }
@@ -316,9 +316,7 @@ fn push_shard_refs(schema: &Schema, object_name: &str, out: &mut Vec<ShardKey>) 
         Some(ObjectType::View {
             object_name: parent,
         }) => {
-            let parent_variant = object_name
-                .rsplit_once('/')
-                .map(|(_, v)| v.to_string());
+            let parent_variant = object_name.rsplit_once('/').map(|(_, v)| v.to_string());
             out.push(ShardKey {
                 canonical: parent.clone(),
                 variant: parent_variant,
@@ -470,10 +468,7 @@ fn emit_create<W: Write>(
     sink.write_all(b"\",\"value\":{")?;
 
     let fields = shard_fields(schema, &shard.key).ok_or_else(|| {
-        CliError::UnexpectedResponse(format!(
-            "no schema available for {}",
-            shard.key.canonical
-        ))
+        CliError::UnexpectedResponse(format!("no schema available for {}", shard.key.canonical))
     })?;
     let query_method = format!("{}/query", shard.key.canonical);
     let get_method = format!("{}/get", shard.key.canonical);
@@ -511,12 +506,12 @@ fn emit_create<W: Write>(
             )));
         }
         let mut iter = resp.responses.into_iter();
-        let q_resp = iter.next().ok_or_else(|| {
-            CliError::UnexpectedResponse("missing query response".into())
-        })?;
-        let g_resp = iter.next().ok_or_else(|| {
-            CliError::UnexpectedResponse("missing get response".into())
-        })?;
+        let q_resp = iter
+            .next()
+            .ok_or_else(|| CliError::UnexpectedResponse("missing query response".into()))?;
+        let g_resp = iter
+            .next()
+            .ok_or_else(|| CliError::UnexpectedResponse("missing get response".into()))?;
         check_response(q_resp, &query_method)?;
         let g_result = check_response(g_resp, &get_method)?;
 
@@ -526,22 +521,21 @@ fn emit_create<W: Write>(
         if list.is_empty() {
             break;
         }
-        let last_id = list.last().and_then(|v| v.get("id").and_then(Value::as_str)).map(String::from);
+        let last_id = list
+            .last()
+            .and_then(|v| v.get("id").and_then(Value::as_str))
+            .map(String::from);
         let returned = list.len();
 
         for item in list {
-            let Some(obj) = item.as_object() else { continue };
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
             let server_id = match obj.get("id").and_then(Value::as_str) {
                 Some(s) => s,
                 None => continue,
             };
-            let mut out_obj = transform_object(
-                schema,
-                fields,
-                obj,
-                allow,
-                include_secrets,
-            );
+            let mut out_obj = transform_object(schema, fields, obj, allow, include_secrets);
             if shard.key.variant.is_some()
                 && let Some(at_type) = obj.get("@type")
             {
@@ -619,9 +613,9 @@ fn emit_singleton_update<W: Write>(
             resolve::display_name(canonical)
         )));
     };
-    let obj = item.as_object().ok_or_else(|| {
-        CliError::UnexpectedResponse("singleton result is not an object".into())
-    })?;
+    let obj = item
+        .as_object()
+        .ok_or_else(|| CliError::UnexpectedResponse("singleton result is not an object".into()))?;
     let transformed = transform_object(schema, fields, obj, allow, include_secrets);
 
     if !*first {
@@ -703,7 +697,9 @@ fn transform_value(
             if allow.contains(base) {
                 return None;
             }
-            let Value::String(id) = value else { return Some(Value::Null) };
+            let Value::String(id) = value else {
+                return Some(Value::Null);
+            };
             let prefix = prefix_for(object_name);
             let mut s = String::with_capacity(prefix.len() + id.len() + 2);
             s.push('#');
@@ -717,7 +713,14 @@ fn transform_value(
             key_class,
             value_class,
             ..
-        } => transform_map(schema, key_class, value_class, value, allow, include_secrets),
+        } => transform_map(
+            schema,
+            key_class,
+            value_class,
+            value,
+            allow,
+            include_secrets,
+        ),
         FieldType::Object { object_name, .. } => {
             transform_embedded(schema, object_name, value, allow, include_secrets)
         }
@@ -734,7 +737,9 @@ fn transform_set(
     value: Value,
     allow: &HashSet<String>,
 ) -> Option<Value> {
-    let Value::Object(map) = value else { return Some(value) };
+    let Value::Object(map) = value else {
+        return Some(value);
+    };
     match class {
         ScalarType::ObjectId { object_name } => {
             let (base, _) = split_view(object_name);
@@ -765,7 +770,9 @@ fn transform_map(
     allow: &HashSet<String>,
     include_secrets: bool,
 ) -> Option<Value> {
-    let Value::Object(map) = value else { return Some(value) };
+    let Value::Object(map) = value else {
+        return Some(value);
+    };
     let prefix = match key_class {
         ScalarType::ObjectId { object_name } => {
             let (base, _) = split_view(object_name);
@@ -810,7 +817,9 @@ fn transform_embedded(
     allow: &HashSet<String>,
     include_secrets: bool,
 ) -> Option<Value> {
-    let Value::Object(map) = value else { return Some(value) };
+    let Value::Object(map) = value else {
+        return Some(value);
+    };
     let obj_schema = schema.schemas.get(object_name)?;
     let fields = match obj_schema {
         ObjectSchema::Single { schema_name } => schema.fields.get(schema_name)?,
@@ -846,7 +855,9 @@ fn transform_object_list(
     allow: &HashSet<String>,
     include_secrets: bool,
 ) -> Option<Value> {
-    let Value::Object(map) = value else { return Some(value) };
+    let Value::Object(map) = value else {
+        return Some(value);
+    };
     let mut out = Map::with_capacity(map.len());
     for (idx, item) in map {
         if let Some(tv) = transform_embedded(schema, object_name, item, allow, include_secrets) {
