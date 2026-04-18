@@ -16,19 +16,19 @@ license = false
 eula = false
 
 [dependencies]
-ahash = { version = "0.8.3", features = ["serde"] }
-anyhow = "1"
-base64 = "0.22"
-clap = { version = "4.5", features = ["derive", "env"] }
-dirs = "5"
-flate2 = "1"
-is-terminal = "0.4"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "rustls-native-certs", "json"] }
-rpassword = "7"
+ahash = { version = "0.8.12", features = ["serde"] }
+anyhow = "1.0.102"
+base64 = "0.22.1"
+clap = { version = "4.6", features = ["derive", "env"] }
+dirs = "6"
+flate2 = "1.1.9"
+is-terminal = "0.4.17"
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls", "json"] }
+rpassword = "7.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
-sha2 = "0.10"
-thiserror = "1"
+sha2 = "0.11"
+thiserror = "2"
 
 [[bin]]
 name = "stalwart-cli"
@@ -41,3 +41,6 @@ strip = "symbols"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[package.metadata.dist]
+allow-dirty = ["ci"]
