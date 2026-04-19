@@ -22,3 +22,8 @@ install-updater = false
 github-attestations = true
 # Allow dist to ignore drift in CI-owned files (e.g. customized release.yml)
 allow-dirty = ["ci"]
+
+# Route aarch64-pc-windows-msvc to a native Windows ARM runner so WiX/MSI can build
+# (the default Linux+cargo-xwin container can cross-compile the binary but not run candle/light)
+[dist.github-custom-runners]
+aarch64-pc-windows-msvc = "windows-11-arm"
