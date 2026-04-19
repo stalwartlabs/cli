@@ -167,7 +167,7 @@ jobs:
       id-token: write
       contents: write
       attestations: write
-    needs: [build-global-artifacts]
+    needs: [host]
     strategy:
       fail-fast: false
       matrix:
@@ -211,7 +211,6 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-      - extra-targets
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -317,7 +316,8 @@ jobs:
       - plan
       - host
       - publish-homebrew-formula
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
+      - extra-targets
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') && (needs.extra-targets.result == 'skipped' || needs.extra-targets.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
