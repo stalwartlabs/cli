@@ -12,7 +12,9 @@ use crate::render::Ansi;
 use crate::schema::Schema;
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION,
+};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use std::io::Read;
@@ -128,17 +130,27 @@ fn fetch_schema_inner(client: &HttpClient, cache: &SchemaCache) -> CliResult<Sch
         if !body.status().is_success() {
             return Err(status_error(body.status()));
         }
+        let content_encoding = body
+            .headers()
+            .get(CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let bytes = body.bytes()?;
-        let decompressed = gunzip(&bytes)?;
-        cache.write(&hash, &decompressed)?;
-        let schema: Schema = serde_json::from_slice(&decompressed)?;
+        let decoded = decode_schema(&bytes, content_encoding.as_deref())?;
+        cache.write(&hash, &decoded)?;
+        let schema: Schema = serde_json::from_slice(&decoded)?;
         Ok(schema)
     } else if status.is_success() {
+        let content_encoding = resp
+            .headers()
+            .get(CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let bytes = resp.bytes()?;
-        let decompressed = gunzip(&bytes)?;
-        let hash = hash_b64(&decompressed);
-        cache.write(&hash, &decompressed)?;
-        let schema: Schema = serde_json::from_slice(&decompressed)?;
+        let decoded = decode_schema(&bytes, content_encoding.as_deref())?;
+        let hash = hash_b64(&decoded);
+        cache.write(&hash, &decoded)?;
+        let schema: Schema = serde_json::from_slice(&decoded)?;
         Ok(schema)
     } else {
         Err(status_error(status))
@@ -167,4 +179,57 @@ fn gunzip(bytes: &[u8]) -> CliResult<Vec<u8>> {
     let mut out = Vec::new();
     dec.read_to_end(&mut out)?;
     Ok(out)
+}
+
+fn decode_schema(bytes: &[u8], content_encoding: Option<&str>) -> CliResult<Vec<u8>> {
+    if is_gzip_encoded(bytes, content_encoding) {
+        gunzip(bytes)
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+fn is_gzip_encoded(bytes: &[u8], content_encoding: Option<&str>) -> bool {
+    content_encoding
+        .map(|value| {
+            value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("gzip"))
+        })
+        .unwrap_or_else(|| bytes.starts_with(&[0x1f, 0x8b]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    #[test]
+    fn decodes_gzipped_schema() {
+        let schema = br#"{"objects":{}}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(schema).unwrap();
+        let encoded = encoder.finish().unwrap();
+
+        assert_eq!(decode_schema(&encoded, Some("gzip")).unwrap(), schema);
+    }
+
+    #[test]
+    fn accepts_plain_schema() {
+        let schema = br#"{"objects":{}}"#;
+
+        assert_eq!(decode_schema(schema, None).unwrap(), schema);
+    }
+
+    #[test]
+    fn decodes_gzipped_schema_without_header() {
+        let schema = br#"{"objects":{}}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(schema).unwrap();
+        let encoded = encoder.finish().unwrap();
+
+        assert_eq!(decode_schema(&encoded, None).unwrap(), schema);
+    }
 }
