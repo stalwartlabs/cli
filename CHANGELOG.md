@@ -11,3 +11,12 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 
+## [0.1.1] - 2026-04-XX
+
+## Added
+
+### Changed
+
+### Fixed
+- Allow JSON schema to be uncompressed.
+

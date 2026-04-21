@@ -12,7 +12,9 @@ use crate::render::Ansi;
 use crate::schema::Schema;
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION,
+};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use std::io::Read;
@@ -128,21 +130,49 @@ fn fetch_schema_inner(client: &HttpClient, cache: &SchemaCache) -> CliResult<Sch
         if !body.status().is_success() {
             return Err(status_error(body.status()));
         }
-        let bytes = body.bytes()?;
-        let decompressed = gunzip(&bytes)?;
-        cache.write(&hash, &decompressed)?;
-        let schema: Schema = serde_json::from_slice(&decompressed)?;
+        let decoded = read_schema_body(body)?;
+        cache.write(&hash, &decoded)?;
+        let schema: Schema = serde_json::from_slice(&decoded)?;
         Ok(schema)
     } else if status.is_success() {
-        let bytes = resp.bytes()?;
-        let decompressed = gunzip(&bytes)?;
-        let hash = hash_b64(&decompressed);
-        cache.write(&hash, &decompressed)?;
-        let schema: Schema = serde_json::from_slice(&decompressed)?;
+        let decoded = read_schema_body(resp)?;
+        let hash = hash_b64(&decoded);
+        cache.write(&hash, &decoded)?;
+        let schema: Schema = serde_json::from_slice(&decoded)?;
         Ok(schema)
     } else {
         Err(status_error(status))
     }
+}
+
+fn read_schema_body(resp: Response) -> CliResult<Vec<u8>> {
+    let encoding = resp
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase());
+    let bytes = resp.bytes()?;
+    decode_schema_body(&bytes, encoding.as_deref())
+}
+
+fn decode_schema_body(bytes: &[u8], content_encoding: Option<&str>) -> CliResult<Vec<u8>> {
+    match content_encoding {
+        Some("gzip") | Some("x-gzip") => gunzip(bytes),
+        Some("identity") | Some("") | None => {
+            if has_gzip_magic(bytes) {
+                gunzip(bytes)
+            } else {
+                Ok(bytes.to_vec())
+            }
+        }
+        Some(other) => Err(CliError::UnexpectedResponse(format!(
+            "unsupported Content-Encoding: {other}"
+        ))),
+    }
+}
+
+fn has_gzip_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b
 }
 
 fn extract_hash_from_location(resp: &Response) -> CliResult<String> {
@@ -167,4 +197,54 @@ fn gunzip(bytes: &[u8]) -> CliResult<Vec<u8>> {
     let mut out = Vec::new();
     dec.read_to_end(&mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn decodes_gzip_with_content_encoding_header() {
+        let plain = br#"{"schema":true}"#;
+        let compressed = gzip(plain);
+        let decoded = decode_schema_body(&compressed, Some("gzip")).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn accepts_plain_json_without_content_encoding() {
+        let plain = br#"{"schema":true}"#;
+        let decoded = decode_schema_body(plain, None).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn falls_back_to_gzip_magic_without_content_encoding() {
+        let plain = br#"{"schema":true}"#;
+        let compressed = gzip(plain);
+        let decoded = decode_schema_body(&compressed, None).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn accepts_plain_json_with_identity_encoding() {
+        let plain = br#"{"schema":true}"#;
+        let decoded = decode_schema_body(plain, Some("identity")).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn rejects_unsupported_content_encoding() {
+        let err = decode_schema_body(b"anything", Some("br")).unwrap_err();
+        assert!(matches!(err, CliError::UnexpectedResponse(_)));
+    }
 }
