@@ -90,7 +90,7 @@ stalwart-cli snapshot Tenant Domain \        # export state as an apply plan
 
 Full documentation, including the bulk-apply file format, JSON Schema, and integration guides for Ansible / Terraform / NixOS / Pulumi / CI:
 
-**[stalw.art/docs/management/cli](https://stalw.art/docs/management/cli)**
+**[stalw.art/docs/management/cli](https://stalw.art/docs/management/cli/overview)**
 
 ## License
 
