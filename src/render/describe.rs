@@ -112,7 +112,7 @@ pub fn describe_object(schema: &Schema, canonical: &str, ansi: Ansi) -> String {
                 out.push_str(ansi.cyan());
                 out.push_str(&v.name);
                 out.push_str(ansi.reset());
-                out.push_str(" — ");
+                out.push_str(": ");
                 out.push_str(&v.label);
                 out.push('\n');
                 if let Some(schema_name) = &v.schema_name

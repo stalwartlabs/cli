@@ -11,8 +11,7 @@ use crate::jmap::Jmap;
 use crate::jmap::protocol::check_response;
 use crate::schema::resolve;
 use crate::schema::{
-    FieldType, Fields, MapValueType, ObjectSchema, ObjectType, ObjectVariant, ScalarType, Schema,
-    StringFormat,
+    FieldType, Fields, MapValueType, ObjectSchema, ObjectType, ScalarType, Schema, StringFormat,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -40,12 +39,13 @@ pub fn run(ctx: &Context, args: &SnapshotArgs) -> CliResult<()> {
     reporter.plan_header(&plan);
 
     let mut sink = open_output(args.output.as_deref())?;
-    sink.write_all(b"[")?;
-    let mut first = true;
 
     if !args.no_destroys {
+        let mut emitted: HashSet<String> = HashSet::new();
         for shard in plan.iter_non_singletons() {
-            emit_destroy(&mut sink, &mut first, shard)?;
+            if emitted.insert(shard.key.canonical.clone()) {
+                emit_destroy(&mut sink, &shard.key.canonical)?;
+            }
         }
     }
 
@@ -58,15 +58,15 @@ pub fn run(ctx: &Context, args: &SnapshotArgs) -> CliResult<()> {
         limit: ctx.session.max_objects_in_get.max(1),
     };
 
+    let mut cache = FetchCache::new();
     for shard in plan.iter_non_singletons() {
-        emit_create(&mut sink, &mut first, &snap_ctx, shard, &mut reporter)?;
+        emit_create(&mut sink, &snap_ctx, shard, &mut cache, &mut reporter)?;
     }
 
     for name in plan.singletons() {
-        emit_singleton_update(&mut sink, &mut first, &snap_ctx, name, &mut reporter)?;
+        emit_singleton_update(&mut sink, &snap_ctx, name, &mut reporter)?;
     }
 
-    sink.write_all(b"]\n")?;
     sink.flush()?;
     reporter.done();
     Ok(())
@@ -430,58 +430,122 @@ fn validate_static_refs(
     Ok(())
 }
 
-fn emit_destroy<W: Write>(sink: &mut W, first: &mut bool, shard: &Shard) -> CliResult<()> {
-    if !*first {
-        sink.write_all(b",\n")?;
-    }
-    *first = false;
+fn emit_destroy<W: Write>(sink: &mut W, canonical: &str) -> CliResult<()> {
     sink.write_all(b"{\"@type\":\"destroy\",\"object\":\"")?;
-    sink.write_all(resolve::display_name(&shard.key.canonical).as_bytes())?;
-    sink.write_all(b"\"")?;
-    if let Some(variant) = &shard.key.variant {
-        sink.write_all(b",\"value\":{\"@type\":\"")?;
-        sink.write_all(variant.as_bytes())?;
-        sink.write_all(b"\"}")?;
-    }
-    sink.write_all(b"}")?;
+    sink.write_all(resolve::display_name(canonical).as_bytes())?;
+    sink.write_all(b"\"}\n")?;
     Ok(())
 }
 
 fn emit_create<W: Write>(
     sink: &mut W,
-    first: &mut bool,
     cx: &Ctx<'_>,
     shard: &Shard,
+    cache: &mut FetchCache,
     reporter: &mut Reporter,
 ) -> CliResult<()> {
-    let jmap = cx.jmap;
     let schema = cx.schema;
     let allow = cx.allow;
     let include_secrets = cx.include_secrets;
-    let limit = cx.limit;
-    if !*first {
-        sink.write_all(b",\n")?;
+    let fields = shard_fields(schema, &shard.key).ok_or_else(|| {
+        CliError::UnexpectedResponse(format!("no schema available for {}", shard.key.canonical))
+    })?;
+
+    cache.ensure(cx, &shard.key.canonical, reporter)?;
+
+    let objs = cache.objects_for(&shard.key);
+    if objs.is_empty() {
+        reporter.shard_done(&shard.key, 0);
+        return Ok(());
     }
-    *first = false;
+
     sink.write_all(b"{\"@type\":\"create\",\"object\":\"")?;
     sink.write_all(resolve::display_name(&shard.key.canonical).as_bytes())?;
     sink.write_all(b"\",\"value\":{")?;
 
-    let fields = shard_fields(schema, &shard.key).ok_or_else(|| {
-        CliError::UnexpectedResponse(format!("no schema available for {}", shard.key.canonical))
-    })?;
-    let query_method = format!("{}/query", shard.key.canonical);
-    let get_method = format!("{}/get", shard.key.canonical);
-    let filter = shard_filter(&shard.key);
-
-    let mut anchor: Option<String> = None;
     let mut first_entry = true;
     let mut total = 0usize;
-    reporter.shard_start(&shard.key);
+    for obj in objs {
+        let server_id = match obj.get("id").and_then(Value::as_str) {
+            Some(s) => s,
+            None => continue,
+        };
+        let mut out_obj = transform_object(schema, fields, obj, allow, include_secrets);
+        if shard.key.variant.is_some()
+            && let Some(at_type) = obj.get("@type")
+        {
+            out_obj.insert("@type".into(), at_type.clone());
+        }
+
+        if !first_entry {
+            sink.write_all(b",")?;
+        }
+        first_entry = false;
+        sink.write_all(b"\"")?;
+        write_client_id(sink, &shard.key.canonical, server_id)?;
+        sink.write_all(b"\":")?;
+        serde_json::to_writer(&mut *sink, &Value::Object(out_obj))?;
+        total += 1;
+    }
+
+    sink.write_all(b"}}\n")?;
+    reporter.shard_done(&shard.key, total);
+    Ok(())
+}
+
+type VariantGroups = HashMap<Option<String>, Vec<Map<String, Value>>>;
+
+struct FetchCache {
+    by_canonical: HashMap<String, VariantGroups>,
+}
+
+impl FetchCache {
+    fn new() -> Self {
+        FetchCache {
+            by_canonical: HashMap::new(),
+        }
+    }
+
+    fn ensure(
+        &mut self,
+        cx: &Ctx<'_>,
+        canonical: &str,
+        reporter: &mut Reporter,
+    ) -> CliResult<()> {
+        if self.by_canonical.contains_key(canonical) {
+            return Ok(());
+        }
+        reporter.fetch_start(canonical);
+        let mut groups: VariantGroups = HashMap::new();
+        let total = fetch_all_partitioned(cx, canonical, &mut groups)?;
+        reporter.fetch_done(total);
+        self.by_canonical.insert(canonical.to_string(), groups);
+        Ok(())
+    }
+
+    fn objects_for(&self, key: &ShardKey) -> &[Map<String, Value>] {
+        self.by_canonical
+            .get(&key.canonical)
+            .and_then(|groups| groups.get(&key.variant))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+fn fetch_all_partitioned(
+    cx: &Ctx<'_>,
+    canonical: &str,
+    groups: &mut VariantGroups,
+) -> CliResult<usize> {
+    let query_method = format!("{canonical}/query");
+    let get_method = format!("{canonical}/get");
+    let limit = cx.limit;
+    let mut anchor: Option<String> = None;
+    let mut total = 0usize;
 
     loop {
         let mut q_args = Map::new();
-        q_args.insert("filter".into(), filter.clone());
+        q_args.insert("filter".into(), json!({}));
         q_args.insert("limit".into(), Value::from(limit));
         if let Some(a) = &anchor {
             q_args.insert("anchor".into(), Value::String(a.clone()));
@@ -492,7 +556,7 @@ fn emit_create<W: Write>(
             "properties": Value::Null,
         });
 
-        let resp = jmap.call_with(
+        let resp = cx.jmap.call_with(
             vec![
                 (query_method.clone(), Value::Object(q_args), "q".into()),
                 (get_method.clone(), get_args, "g".into()),
@@ -527,56 +591,30 @@ fn emit_create<W: Write>(
             .map(String::from);
         let returned = list.len();
 
-        for item in list {
-            let Some(obj) = item.as_object() else {
-                continue;
-            };
-            let server_id = match obj.get("id").and_then(Value::as_str) {
-                Some(s) => s,
-                None => continue,
-            };
-            let mut out_obj = transform_object(schema, fields, obj, allow, include_secrets);
-            if shard.key.variant.is_some()
-                && let Some(at_type) = obj.get("@type")
-            {
-                out_obj.insert("@type".into(), at_type.clone());
-            }
-
-            if !first_entry {
-                sink.write_all(b",")?;
-            }
-            first_entry = false;
-            sink.write_all(b"\"")?;
-            write_client_id(sink, &shard.key.canonical, server_id)?;
-            sink.write_all(b"\":")?;
-            serde_json::to_writer(&mut *sink, &Value::Object(out_obj))?;
-        }
+        partition_into(list, groups);
         total += returned;
 
         if returned < limit {
             break;
         }
-        anchor = last_id;
-        if anchor.is_none() {
-            break;
+        match last_id {
+            Some(a) => anchor = Some(a),
+            None => break,
         }
     }
-
-    sink.write_all(b"}}")?;
-    reporter.shard_done(&shard.key, total);
-    Ok(())
+    Ok(total)
 }
 
-fn shard_filter(key: &ShardKey) -> Value {
-    match &key.variant {
-        Some(v) => json!({ "@type": v }),
-        None => json!({}),
+fn partition_into(list: &[Value], groups: &mut VariantGroups) {
+    for item in list {
+        let Some(obj) = item.as_object() else { continue };
+        let variant = obj.get("@type").and_then(Value::as_str).map(String::from);
+        groups.entry(variant).or_default().push(obj.clone());
     }
 }
 
 fn emit_singleton_update<W: Write>(
     sink: &mut W,
-    first: &mut bool,
     cx: &Ctx<'_>,
     canonical: &str,
     reporter: &mut Reporter,
@@ -618,15 +656,11 @@ fn emit_singleton_update<W: Write>(
         .ok_or_else(|| CliError::UnexpectedResponse("singleton result is not an object".into()))?;
     let transformed = transform_object(schema, fields, obj, allow, include_secrets);
 
-    if !*first {
-        sink.write_all(b",\n")?;
-    }
-    *first = false;
     sink.write_all(b"{\"@type\":\"update\",\"object\":\"")?;
     sink.write_all(resolve::display_name(canonical).as_bytes())?;
     sink.write_all(b"\",\"value\":")?;
     serde_json::to_writer(&mut *sink, &Value::Object(transformed))?;
-    sink.write_all(b"}")?;
+    sink.write_all(b"}\n")?;
     reporter.singleton_done(canonical);
     Ok(())
 }
@@ -888,7 +922,25 @@ impl Reporter {
             plan.singletons.len()
         );
     }
-    fn shard_start(&mut self, key: &ShardKey) {
+    fn fetch_start(&mut self, canonical: &str) {
+        if self.quiet {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(
+            err,
+            "  fetching {}...",
+            resolve::display_name(canonical)
+        );
+    }
+    fn fetch_done(&mut self, count: usize) {
+        if self.quiet {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "    {count} fetched");
+    }
+    fn shard_done(&mut self, key: &ShardKey, count: usize) {
         if self.quiet {
             return;
         }
@@ -897,7 +949,7 @@ impl Reporter {
             Some(v) => {
                 let _ = writeln!(
                     err,
-                    "  fetching {} ({})...",
+                    "    {} ({}): {count}",
                     resolve::display_name(&key.canonical),
                     v
                 );
@@ -905,18 +957,11 @@ impl Reporter {
             None => {
                 let _ = writeln!(
                     err,
-                    "  fetching {}...",
+                    "    {}: {count}",
                     resolve::display_name(&key.canonical)
                 );
             }
         }
-    }
-    fn shard_done(&mut self, _key: &ShardKey, count: usize) {
-        if self.quiet {
-            return;
-        }
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "    -> {count}");
     }
     fn singleton_start(&mut self, canonical: &str) {
         if self.quiet {
@@ -939,9 +984,6 @@ impl Reporter {
     }
 }
 
-#[allow(dead_code)]
-fn _keep_variant_symbol(_: &ObjectVariant) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,6 +1000,21 @@ mod tests {
     fn split_view_parsing() {
         assert_eq!(split_view("x:Account/Group"), ("x:Account", Some("Group")));
         assert_eq!(split_view("x:Domain"), ("x:Domain", None));
+    }
+
+    #[test]
+    fn partition_by_at_type() {
+        let list = vec![
+            json!({ "id": "a", "@type": "User" }),
+            json!({ "id": "b", "@type": "Group" }),
+            json!({ "id": "c", "@type": "User" }),
+            json!({ "id": "d" }),
+        ];
+        let mut groups = HashMap::new();
+        partition_into(&list, &mut groups);
+        assert_eq!(groups[&Some("User".to_string())].len(), 2);
+        assert_eq!(groups[&Some("Group".to_string())].len(), 1);
+        assert_eq!(groups[&None].len(), 1);
     }
 
     #[test]

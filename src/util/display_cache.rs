@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct DisplayCache {
-    names: HashMap<(String, String), String>,
+    by_object: HashMap<String, HashMap<String, String>>,
 }
 
 impl DisplayCache {
@@ -21,9 +21,17 @@ impl DisplayCache {
     }
 
     pub fn get(&self, object_name: &str, id: &str) -> Option<&str> {
-        self.names
-            .get(&(object_name.to_string(), id.to_string()))
+        self.by_object
+            .get(object_name)?
+            .get(id)
             .map(String::as_str)
+    }
+
+    fn filter_uncached(&self, object_name: &str, ids: HashSet<String>) -> Vec<String> {
+        match self.by_object.get(object_name) {
+            None => ids.into_iter().collect(),
+            Some(cached) => ids.into_iter().filter(|id| !cached.contains_key(id)).collect(),
+        }
     }
 
     pub fn populate_from_objects(
@@ -53,7 +61,11 @@ impl DisplayCache {
             let Some(label_prop) = &list.label_property else {
                 continue;
             };
-            let ids_vec: Vec<Value> = ids.into_iter().map(Value::String).collect();
+            let ids_vec: Vec<Value> = self
+                .filter_uncached(&object_name, ids)
+                .into_iter()
+                .map(Value::String)
+                .collect();
             if ids_vec.is_empty() {
                 continue;
             }
@@ -85,8 +97,10 @@ impl DisplayCache {
                     Value::Bool(b) => b.to_string(),
                     _ => continue,
                 };
-                self.names
-                    .insert((object_name.clone(), id.to_string()), label);
+                self.by_object
+                    .entry(object_name.clone())
+                    .or_default()
+                    .insert(id.to_string(), label);
             }
         }
         Ok(())
@@ -189,5 +203,87 @@ fn collect_nested(
     };
     if let Some(f) = fields {
         collect_map(schema, f, obj, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_with(entries: &[(&str, &str, &str)]) -> DisplayCache {
+        let mut c = DisplayCache::new();
+        for (obj, id, label) in entries {
+            c.by_object
+                .entry((*obj).to_string())
+                .or_default()
+                .insert((*id).to_string(), (*label).to_string());
+        }
+        c
+    }
+
+    #[test]
+    fn get_returns_label_when_present() {
+        let c = cache_with(&[("x:Domain", "d1", "example.com")]);
+        assert_eq!(c.get("x:Domain", "d1"), Some("example.com"));
+    }
+
+    #[test]
+    fn get_returns_none_for_unknown_object() {
+        let c = cache_with(&[("x:Domain", "d1", "example.com")]);
+        assert_eq!(c.get("x:Account", "d1"), None);
+    }
+
+    #[test]
+    fn get_returns_none_for_unknown_id() {
+        let c = cache_with(&[("x:Domain", "d1", "example.com")]);
+        assert_eq!(c.get("x:Domain", "d2"), None);
+    }
+
+    #[test]
+    fn get_does_not_mutate_or_allocate_into_cache() {
+        let c = cache_with(&[("x:Domain", "d1", "example.com")]);
+        let before = c.by_object.get("x:Domain").map(|m| m.len()).unwrap_or(0);
+        let _ = c.get("x:Domain", "missing");
+        let _ = c.get("x:Account", "anything");
+        let after = c.by_object.get("x:Domain").map(|m| m.len()).unwrap_or(0);
+        assert_eq!(before, after);
+        assert!(!c.by_object.contains_key("x:Account"));
+    }
+
+    fn ids(strs: &[&str]) -> HashSet<String> {
+        strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn filter_uncached_returns_all_when_object_unknown() {
+        let c = DisplayCache::new();
+        let result = c.filter_uncached("x:Domain", ids(&["a", "b", "c"]));
+        assert_eq!(sorted(result), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn filter_uncached_drops_already_cached_ids() {
+        let c = cache_with(&[("x:Domain", "a", "alpha"), ("x:Domain", "c", "gamma")]);
+        let result = c.filter_uncached("x:Domain", ids(&["a", "b", "c", "d"]));
+        assert_eq!(sorted(result), vec!["b", "d"]);
+    }
+
+    #[test]
+    fn filter_uncached_returns_empty_when_all_cached() {
+        let c = cache_with(&[("x:Domain", "a", "alpha"), ("x:Domain", "b", "beta")]);
+        let result = c.filter_uncached("x:Domain", ids(&["a", "b"]));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_uncached_isolates_per_object_type() {
+        let c = cache_with(&[("x:Domain", "shared", "d1")]);
+        let result = c.filter_uncached("x:Account", ids(&["shared"]));
+        assert_eq!(sorted(result), vec!["shared"]);
     }
 }

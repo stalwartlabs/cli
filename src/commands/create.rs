@@ -50,7 +50,7 @@ pub fn run(ctx: &Context, args: &CreateArgs) -> CliResult<()> {
     let result = jmap.call(
         &method,
         json!({
-            "create": { "n0": Value::Object(input.clone()) },
+            "create": { "n0": Value::Object(input) },
         }),
     )?;
 
@@ -75,7 +75,6 @@ pub fn run(ctx: &Context, args: &CreateArgs) -> CliResult<()> {
         .ok_or_else(|| CliError::UnexpectedResponse("created object missing id".into()))?
         .to_string();
 
-    let _ = input;
     let ansi = Ansi::new(ctx.config.color);
     let mut stdout = std::io::stdout().lock();
     writeln!(

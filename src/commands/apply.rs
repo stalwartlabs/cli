@@ -21,8 +21,7 @@ use std::io::{Read, Write};
 
 pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
     let input = read_input(args)?;
-    let raw_ops: Vec<RawOp> = serde_json::from_str(&input)
-        .map_err(|e| CliError::msg(format!("invalid plan JSON: {e}")))?;
+    let raw_ops = parse_ndjson_plan(&input)?;
 
     let plan = Plan::resolve(&ctx.schema, raw_ops)?;
 
@@ -128,6 +127,21 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
         )));
     }
     Ok(())
+}
+
+fn parse_ndjson_plan(input: &str) -> CliResult<Vec<RawOp>> {
+    let mut ops = Vec::new();
+    for (lineno, line) in input.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let op: RawOp = serde_json::from_str(trimmed).map_err(|e| {
+            CliError::msg(format!("invalid plan NDJSON on line {}: {e}", lineno + 1))
+        })?;
+        ops.push(op);
+    }
+    Ok(ops)
 }
 
 fn read_input(args: &ApplyArgs) -> CliResult<String> {
@@ -835,5 +849,51 @@ mod tests {
         let got = request_created_ids(&refs, &state, &in_flight);
         assert_eq!(got.get("a"), None);
         assert_eq!(got.get("b").map(String::as_str), Some("sb"));
+    }
+
+    #[test]
+    fn parses_three_ndjson_records() {
+        let input = "{\"@type\":\"destroy\",\"object\":\"Domain\"}\n\
+                     {\"@type\":\"create\",\"object\":\"Domain\",\"value\":{\"d1\":{\"name\":\"a\"}}}\n\
+                     {\"@type\":\"update\",\"object\":\"DataStore\",\"id\":\"singleton\",\"value\":{}}\n";
+        let ops = parse_ndjson_plan(input).unwrap();
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], RawOp::Destroy { .. }));
+        assert!(matches!(ops[1], RawOp::Create { .. }));
+        assert!(matches!(ops[2], RawOp::Update { .. }));
+    }
+
+    #[test]
+    fn skips_blank_lines_and_trailing_newline() {
+        let input = "\n  \n{\"@type\":\"destroy\",\"object\":\"Domain\"}\n\n";
+        let ops = parse_ndjson_plan(input).unwrap();
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn empty_input_yields_no_ops() {
+        let ops = parse_ndjson_plan("").unwrap();
+        assert!(ops.is_empty());
+        let ops = parse_ndjson_plan("\n  \n\n").unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn invalid_line_reports_line_number() {
+        let input = "{\"@type\":\"destroy\",\"object\":\"Domain\"}\n\
+                     not json at all\n";
+        let err = parse_ndjson_plan(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("line 2"), "expected line 2, got: {msg}");
+    }
+
+    #[test]
+    fn rejects_json_array_form() {
+        // The pre-NDJSON format was `[{...},{...}]` on a single line; that
+        // should now fail because the bracketed form is not a valid op record.
+        let input = "[{\"@type\":\"destroy\",\"object\":\"Domain\"}]\n";
+        let err = parse_ndjson_plan(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("line 1"));
     }
 }

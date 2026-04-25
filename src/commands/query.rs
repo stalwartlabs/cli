@@ -47,12 +47,12 @@ pub fn run(ctx: &Context, args: &QueryArgs) -> CliResult<()> {
         let props = columns
             .as_ref()
             .map(|cs| cs.iter().map(|c| c.name.clone()).collect::<Vec<_>>());
-        return run_json(ctx, &jmap, canonical, &filter, props.as_deref(), limit);
+        return run_json(ctx, &jmap, canonical, filter, props.as_deref(), limit);
     }
 
     match columns {
-        None => run_ids(ctx, &jmap, canonical, &filter, limit),
-        Some(cols) => run_table(ctx, &jmap, canonical, &filter, &cols, &union, limit),
+        None => run_ids(ctx, &jmap, canonical, filter, limit),
+        Some(cols) => run_table(ctx, &jmap, canonical, filter, &cols, &union, limit),
     }
 }
 
@@ -338,42 +338,34 @@ fn union_fields(schema: &Schema, canonical: &str) -> Fields {
 }
 
 struct Pager {
-    limit: usize,
-    anchor: Option<String>,
+    args: Map<String, Value>,
 }
 
 impl Pager {
-    fn new(limit: usize) -> Self {
-        Pager {
-            limit,
-            anchor: None,
-        }
+    fn new(filter: Value, limit: usize) -> Self {
+        let mut args = Map::with_capacity(4);
+        args.insert("filter".to_string(), filter);
+        args.insert("limit".to_string(), Value::from(limit));
+        args.insert("calculateTotal".to_string(), Value::Bool(true));
+        Pager { args }
     }
+
     fn advance(&mut self, last_id: String) {
-        self.anchor = Some(last_id);
+        self.args.remove("calculateTotal");
+        self.args
+            .insert("anchor".to_string(), Value::String(last_id));
+        self.args
+            .insert("anchorOffset".to_string(), Value::from(1));
     }
-    fn query_args(&self, filter: &Value) -> Value {
-        let mut args = Map::new();
-        args.insert("filter".to_string(), filter.clone());
-        args.insert("limit".to_string(), Value::from(self.limit));
-        if let Some(a) = &self.anchor {
-            args.insert("anchor".to_string(), Value::String(a.clone()));
-            args.insert("anchorOffset".to_string(), Value::from(1));
-        } else {
-            args.insert("calculateTotal".to_string(), Value::Bool(true));
-        }
-        Value::Object(args)
+
+    fn query_args(&self) -> Value {
+        Value::Object(self.args.clone())
     }
 }
 
-fn fetch_ids(
-    jmap: &Jmap,
-    canonical: &str,
-    filter: &Value,
-    pager: &Pager,
-) -> CliResult<Vec<String>> {
+fn fetch_ids(jmap: &Jmap, canonical: &str, pager: &Pager) -> CliResult<Vec<String>> {
     let method = format!("{canonical}/query");
-    let result = jmap.call(&method, pager.query_args(filter))?;
+    let result = jmap.call(&method, pager.query_args())?;
     Ok(result
         .get("ids")
         .and_then(Value::as_array)
@@ -388,18 +380,13 @@ fn fetch_ids(
 fn fetch_rows(
     jmap: &Jmap,
     canonical: &str,
-    filter: &Value,
     pager: &Pager,
     properties: &[String],
 ) -> CliResult<Vec<Map<String, Value>>> {
     let query_method = format!("{canonical}/query");
     let get_method = format!("{canonical}/get");
     let calls = vec![
-        (
-            query_method.clone(),
-            pager.query_args(filter),
-            "q".to_string(),
-        ),
+        (query_method.clone(), pager.query_args(), "q".to_string()),
         (
             get_method.clone(),
             json!({
@@ -437,16 +424,16 @@ fn run_ids(
     _ctx: &Context,
     jmap: &Jmap,
     canonical: &str,
-    filter: &Value,
+    filter: Value,
     limit: usize,
 ) -> CliResult<()> {
     let is_tty = std::io::stdout().is_terminal();
-    let mut pager = Pager::new(limit);
+    let mut pager = Pager::new(filter, limit);
     let mut displayed = 0usize;
     let mut stdout = std::io::stdout().lock();
 
     loop {
-        let ids = fetch_ids(jmap, canonical, filter, &pager)?;
+        let ids = fetch_ids(jmap, canonical, &pager)?;
         if ids.is_empty() {
             break;
         }
@@ -487,25 +474,25 @@ fn run_table(
     ctx: &Context,
     jmap: &Jmap,
     canonical: &str,
-    filter: &Value,
+    filter: Value,
     columns: &[Column],
     union: &Fields,
     limit: usize,
 ) -> CliResult<()> {
     let is_tty = std::io::stdout().is_terminal();
     let ansi = Ansi::new(ctx.config.color);
-    let mut pager = Pager::new(limit);
+    let mut pager = Pager::new(filter, limit);
     let mut displayed = 0usize;
     let properties: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let mut cache = DisplayCache::new();
 
     loop {
-        let rows = fetch_rows(jmap, canonical, filter, &pager, &properties)?;
+        let rows = fetch_rows(jmap, canonical, &pager, &properties)?;
         if rows.is_empty() {
             break;
         }
         let last_page = rows.len() < limit;
 
-        let mut cache = DisplayCache::new();
         let refs: Vec<&Map<String, Value>> = rows.iter().collect();
         cache.populate_from_objects(jmap, &ctx.schema, union, &refs)?;
 
@@ -695,15 +682,15 @@ fn run_json(
     _ctx: &Context,
     jmap: &Jmap,
     canonical: &str,
-    filter: &Value,
+    filter: Value,
     properties: Option<&[String]>,
     limit: usize,
 ) -> CliResult<()> {
-    let mut pager = Pager::new(limit);
-    let value = if let Some(props) = properties {
-        let mut all: Vec<Map<String, Value>> = Vec::new();
+    let mut pager = Pager::new(filter, limit);
+    let mut stdout = std::io::stdout().lock();
+    if let Some(props) = properties {
         loop {
-            let rows = fetch_rows(jmap, canonical, filter, &pager, props)?;
+            let rows = fetch_rows(jmap, canonical, &pager, props)?;
             if rows.is_empty() {
                 break;
             }
@@ -712,7 +699,9 @@ fn run_json(
                 .last()
                 .and_then(|r| r.get("id").and_then(Value::as_str))
                 .map(String::from);
-            all.extend(rows);
+            for row in rows {
+                writeln!(stdout, "{}", serde_json::to_string(&Value::Object(row))?)?;
+            }
             if last {
                 break;
             }
@@ -721,26 +710,26 @@ fn run_json(
                 None => break,
             }
         }
-        Value::Array(all.into_iter().map(Value::Object).collect())
     } else {
-        let mut all: Vec<String> = Vec::new();
         loop {
-            let ids = fetch_ids(jmap, canonical, filter, &pager)?;
+            let ids = fetch_ids(jmap, canonical, &pager)?;
             if ids.is_empty() {
                 break;
             }
             let last = ids.len() < limit;
-            if let Some(id) = ids.last() {
-                pager.advance(id.clone());
+            let last_id = ids.last().cloned();
+            for id in ids {
+                writeln!(stdout, "{}", serde_json::to_string(&Value::String(id))?)?;
             }
-            all.extend(ids);
             if last {
                 break;
             }
+            match last_id {
+                Some(id) => pager.advance(id),
+                None => break,
+            }
         }
-        Value::Array(all.into_iter().map(Value::String).collect())
-    };
-    writeln!(std::io::stdout(), "{}", serde_json::to_string(&value)?)?;
+    }
     Ok(())
 }
 
@@ -782,5 +771,47 @@ mod tests {
     fn visible_width_strips_ansi() {
         assert_eq!(visible_width("\x1b[1mhi\x1b[0m"), 2);
         assert_eq!(visible_width("hello"), 5);
+    }
+
+    #[test]
+    fn pager_first_page_has_calculate_total_no_anchor() -> CliResult<()> {
+        let pager = Pager::new(json!({ "name": "x" }), 50);
+        let args = pager.query_args();
+        let m = args
+            .as_object()
+            .ok_or_else(|| CliError::msg("args not object"))?;
+        assert_eq!(m.get("calculateTotal"), Some(&Value::Bool(true)));
+        assert_eq!(m.get("limit"), Some(&Value::from(50)));
+        assert_eq!(m.get("filter"), Some(&json!({ "name": "x" })));
+        assert!(m.get("anchor").is_none());
+        assert!(m.get("anchorOffset").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn pager_advance_swaps_in_anchor_and_drops_total() -> CliResult<()> {
+        let mut pager = Pager::new(json!({}), 50);
+        pager.advance("id-99".to_string());
+        let args = pager.query_args();
+        let m = args
+            .as_object()
+            .ok_or_else(|| CliError::msg("args not object"))?;
+        assert!(m.get("calculateTotal").is_none());
+        assert_eq!(m.get("anchor"), Some(&Value::String("id-99".into())));
+        assert_eq!(m.get("anchorOffset"), Some(&Value::from(1)));
+        assert_eq!(m.get("limit"), Some(&Value::from(50)));
+        Ok(())
+    }
+
+    #[test]
+    fn pager_args_clones_filter_each_call_without_mutating_owned() {
+        let pager = Pager::new(json!({ "name": "stable" }), 10);
+        let _ = pager.query_args();
+        let _ = pager.query_args();
+        let args = pager.query_args();
+        assert_eq!(
+            args.get("filter").and_then(|v| v.get("name")),
+            Some(&Value::String("stable".into()))
+        );
     }
 }

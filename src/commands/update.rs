@@ -64,19 +64,16 @@ pub fn run(ctx: &Context, args: &UpdateArgs) -> CliResult<()> {
         }),
     )?;
 
-    if let Some(not_updated) = result.get("notUpdated").and_then(Value::as_object)
-        && let Some(err_val) = not_updated.get(&id)
-    {
-        let set_err: SetError = serde_json::from_value(err_val.clone())?;
-        let ansi = Ansi::new(ctx.config.color);
-        eprintln!("{}", set_error::render(&set_err, ansi));
-        return Err(CliError::msg("update failed"));
-    }
-
-    let updated = result
-        .get("updated")
-        .and_then(Value::as_object)
-        .and_then(|m| m.get(&id));
+    let outcome = interpret_update_response(&result, &id, canonical)?;
+    let updated = match outcome {
+        UpdateOutcome::Failed(err_val) => {
+            let set_err: SetError = serde_json::from_value(err_val)?;
+            let ansi = Ansi::new(ctx.config.color);
+            eprintln!("{}", set_error::render(&set_err, ansi));
+            return Err(CliError::msg("update failed"));
+        }
+        UpdateOutcome::Ok(v) => v,
+    };
 
     let ansi = Ansi::new(ctx.config.color);
     let mut stdout = std::io::stdout().lock();
@@ -103,6 +100,32 @@ pub fn run(ctx: &Context, args: &UpdateArgs) -> CliResult<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum UpdateOutcome {
+    Ok(Option<Value>),
+    Failed(Value),
+}
+
+fn interpret_update_response(
+    result: &Value,
+    id: &str,
+    canonical: &str,
+) -> CliResult<UpdateOutcome> {
+    if let Some(not_updated) = result.get("notUpdated").and_then(Value::as_object)
+        && let Some(err_val) = not_updated.get(id)
+    {
+        return Ok(UpdateOutcome::Failed(err_val.clone()));
+    }
+    let updated_map = result.get("updated").and_then(Value::as_object);
+    match updated_map.and_then(|m| m.get(id)) {
+        Some(v) => Ok(UpdateOutcome::Ok(Some(v.clone()))),
+        None => Err(CliError::msg(format!(
+            "{}: server did not acknowledge update for id `{id}` (the id may not exist)",
+            resolve::display_name(canonical),
+        ))),
+    }
+}
+
 fn union_or_single_fields(schema: &crate::schema::Schema, canonical: &str) -> Fields {
     let Some(obj_schema) = schema.schemas.get(canonical) else {
         return Fields::default();
@@ -126,5 +149,63 @@ fn union_or_single_fields(schema: &crate::schema::Schema, canonical: &str) -> Fi
             }
             out
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ok_with_object_extras() -> CliResult<()> {
+        let resp = json!({ "updated": { "abc": { "secretKey": "k" } } });
+        let outcome = interpret_update_response(&resp, "abc", "x:Domain")?;
+        match outcome {
+            UpdateOutcome::Ok(Some(Value::Object(m))) => {
+                assert_eq!(m.get("secretKey").and_then(Value::as_str), Some("k"));
+            }
+            _ => return Err(CliError::msg("expected Ok with object")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ok_with_null_extras() -> CliResult<()> {
+        let resp = json!({ "updated": { "abc": null } });
+        let outcome = interpret_update_response(&resp, "abc", "x:Domain")?;
+        assert!(matches!(outcome, UpdateOutcome::Ok(Some(Value::Null))));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_returns_set_error_value() -> CliResult<()> {
+        let resp = json!({
+            "notUpdated": { "abc": { "type": "invalidProperties" } }
+        });
+        let outcome = interpret_update_response(&resp, "abc", "x:Domain")?;
+        match outcome {
+            UpdateOutcome::Failed(v) => {
+                assert_eq!(v.get("type").and_then(Value::as_str), Some("invalidProperties"));
+            }
+            _ => return Err(CliError::msg("expected Failed")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_id_in_both_maps_errors() {
+        let resp = json!({ "updated": { "other": null }, "notUpdated": {} });
+        let result = interpret_update_response(&resp, "abc", "x:Domain");
+        let err = result.expect_err("expected Err");
+        let msg = format!("{err}");
+        assert!(msg.contains("did not acknowledge"));
+        assert!(msg.contains("abc"));
+    }
+
+    #[test]
+    fn empty_response_errors() {
+        let resp = json!({});
+        let err = interpret_update_response(&resp, "abc", "x:Domain");
+        assert!(err.is_err());
     }
 }
