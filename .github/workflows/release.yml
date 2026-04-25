@@ -205,7 +205,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: target/${{ matrix.target }}/release/stalwart-cli-${{ matrix.name }}.tar.gz
-          
+          draft: true
+
+
   host:
     needs:
       - plan
@@ -260,13 +262,14 @@ jobs:
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          awk '/^## \[/{c++} c==1' CHANGELOG.md > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          # Tag-push releases are created as drafts; the `announce` job un-drafts
+          # them only after the build succeeds, so watcher notifications don't
+          # fire on broken builds.
+          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --draft --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   publish-homebrew-formula:
     needs:
@@ -326,3 +329,25 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Un-draft release
+        run: gh release edit "${{ needs.plan.outputs.tag }}" --draft=false --repo "${{ github.repository }}"
+
+  cleanup:
+    name: Cleanup failed release
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+      - extra-targets
+      - host
+      - publish-homebrew-formula
+      - announce
+    if: ${{ failure() && needs.plan.outputs.publishing == 'true' }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: write
+    steps:
+      - name: Delete draft release and tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete "${{ needs.plan.outputs.tag }}" --yes --cleanup-tag --repo "${{ github.repository }}" || true
