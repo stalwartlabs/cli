@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.3] - 2026-04-27
+
+### Added
+
+### Changed
+- `snapshot` errors more clearly when the user passes the name of an embedded type (e.g. `Credential`).
+- When a remaining cycle has only immutable edges, the error now lists only the strongly-connected nodes.
+
+### Fixed
+- `snapshot` now breaks dependency cycles between selected types by deferring the cycle-closing field.
+- `snapshot` recommends `--allow-unresolved <T>` instead of "add T" when adding `T` to the selection would itself form a cycle.
+
 ## [1.0.2] - 2026-04-25
 
 ### Added

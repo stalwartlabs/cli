@@ -1,11 +1,14 @@
 use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const URL: &str = "http://localhost:8080";
 const USER: &str = "admin";
 const PASS: &str = "admin";
+
+const SEED_DOMAIN: &str = "itest-cli.local";
+const SEED_ADMIN_NAME: &str = "admin";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_stalwart-cli")
@@ -84,10 +87,128 @@ impl Drop for DomainCleanup {
     fn drop(&mut self) {
         let _ = Command::new(bin())
             .args([
-                "--url", URL, "--user", USER, "--password", PASS, "delete", "Domain", "--ids",
+                "--url",
+                URL,
+                "--user",
+                USER,
+                "--password",
+                PASS,
+                "delete",
+                "Domain",
+                "--ids",
                 &self.0,
             ])
             .output();
+    }
+}
+
+fn state_lock() -> MutexGuard<'static, ()> {
+    static M: OnceLock<Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn ndjson_field(out: &Output, key: &str) -> Vec<String> {
+    stdout_string(out)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v.get(key).and_then(Value::as_str).map(String::from))
+        })
+        .collect()
+}
+
+fn delete_ids(object: &str, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let csv = ids.join(",");
+    let _ = run_args(&["delete", object, "--ids", &csv]);
+}
+
+fn delete_id(object: &str, id: &str) {
+    let _ = run_args(&["delete", object, "--ids", id]);
+}
+
+fn ids_for(object: &str) -> Vec<String> {
+    let out = run_args(&["query", object, "--fields", "id", "--json"]);
+    if !out.status.success() {
+        return Vec::new();
+    }
+    ndjson_field(&out, "id")
+}
+
+fn ids_where(object: &str, filter: &str) -> Vec<String> {
+    let out = run_args(&[
+        "query", object, "--where", filter, "--fields", "id", "--json",
+    ]);
+    if !out.status.success() {
+        return Vec::new();
+    }
+    ndjson_field(&out, "id")
+}
+
+fn create_capture_id(args: &[&str]) -> Option<String> {
+    let out = run_args(args);
+    if !out.status.success() {
+        return None;
+    }
+    stdout_string(&out)
+        .split_whitespace()
+        .last()
+        .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
+}
+
+struct SeededAdmin {
+    domain_id: String,
+    account_id: String,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for SeededAdmin {
+    fn drop(&mut self) {
+        delete_id("Account", &self.account_id);
+        let dkim = ids_where("DkimSignature", &format!("domainId={}", self.domain_id));
+        delete_ids("DkimSignature", &dkim);
+        delete_id("Domain", &self.domain_id);
+    }
+}
+
+fn seed_admin_account() -> SeededAdmin {
+    let guard = state_lock();
+    let existing = ids_for("Account");
+    delete_ids("Account", &existing);
+
+    let domain_id = ids_where("Domain", &format!("name={SEED_DOMAIN}"))
+        .into_iter()
+        .next()
+        .or_else(|| {
+            create_capture_id(&[
+                "create",
+                "Domain",
+                "--field",
+                &format!("name={SEED_DOMAIN}"),
+            ])
+        })
+        .expect("seed domain");
+
+    let account_id = create_capture_id(&[
+        "create",
+        "Account/User",
+        "--field",
+        &format!("name={SEED_ADMIN_NAME}"),
+        "--field",
+        &format!("domainId={domain_id}"),
+    ])
+    .expect("seed admin account");
+
+    SeededAdmin {
+        domain_id,
+        account_id,
+        _guard: guard,
     }
 }
 
@@ -108,19 +229,30 @@ fn describe_account_shows_variants_with_no_em_dash() {
     assert_ok(&out, "describe Account");
     let s = stdout_string(&out);
     assert!(s.contains("Variants:"));
-    assert!(s.contains("User: User account"), "User variant label missing or wrong separator");
+    assert!(
+        s.contains("User: User account"),
+        "User variant label missing or wrong separator"
+    );
     assert!(s.contains("Group: Group account"));
-    assert!(!s.contains('\u{2014}'), "describe output must not contain em dash");
+    assert!(
+        !s.contains('\u{2014}'),
+        "describe output must not contain em dash"
+    );
 }
 
 #[test]
 fn query_json_is_ndjson_not_array() {
     require_server!();
+    let _seed = seed_admin_account();
+
     let out = run_args(&["query", "Account", "--fields", "id,name", "--json"]);
     assert_ok(&out, "query --json");
     let s = stdout_string(&out);
     let trimmed = s.trim();
-    assert!(!trimmed.starts_with('['), "output must not be a JSON array: {trimmed}");
+    assert!(
+        !trimmed.starts_with('['),
+        "output must not be a JSON array: {trimmed}"
+    );
     let mut count = 0usize;
     for line in trimmed.lines() {
         if line.trim().is_empty() {
@@ -136,6 +268,8 @@ fn query_json_is_ndjson_not_array() {
 #[test]
 fn query_table_render_includes_header_and_admin_row() {
     require_server!();
+    let _seed = seed_admin_account();
+
     let out = run_args(&["query", "Account", "--fields", "id,name"]);
     assert_ok(&out, "query Account (table)");
     let s = stdout_string(&out);
@@ -156,20 +290,15 @@ fn query_table_render_includes_header_and_admin_row() {
 #[test]
 fn get_admin_account_renders_human() {
     require_server!();
-    let out = run_args(&["query", "Account", "--fields", "id,name", "--json"]);
-    assert_ok(&out, "query Account");
-    let line = stdout_string(&out)
-        .lines()
-        .next()
-        .expect("at least one Account")
-        .to_string();
-    let v: Value = serde_json::from_str(&line).expect("json");
-    let id = v["id"].as_str().expect("id").to_string();
+    let seed = seed_admin_account();
 
-    let out = run_args(&["get", "Account", &id]);
+    let out = run_args(&["get", "Account", &seed.account_id]);
     assert_ok(&out, "get Account <id>");
     let s = stdout_string(&out);
-    assert!(s.contains("admin"), "expected admin name in get output: {s}");
+    assert!(
+        s.contains("admin"),
+        "expected admin name in get output: {s}"
+    );
 }
 
 #[test]
@@ -179,7 +308,10 @@ fn snapshot_tracer_emits_ndjson_with_no_at_type_filter() {
     assert_ok(&out, "snapshot Tracer");
     let s = stdout_string(&out);
     let trimmed = s.trim();
-    assert!(!trimmed.starts_with('['), "snapshot output must be NDJSON, not a JSON array");
+    assert!(
+        !trimmed.starts_with('['),
+        "snapshot output must be NDJSON, not a JSON array"
+    );
 
     let mut destroy_seen = false;
     let mut create_seen = false;
@@ -237,7 +369,10 @@ fn apply_skips_blank_lines_and_handles_trailing_newline() {
     let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
     assert_ok(&out, "apply tolerates blank lines");
     let s = stderr_string(&out);
-    assert!(s.contains("1 destroy"), "plan summary missing in stderr: {s}");
+    assert!(
+        s.contains("1 destroy"),
+        "plan summary missing in stderr: {s}"
+    );
 }
 
 #[test]

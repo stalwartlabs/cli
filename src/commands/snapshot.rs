@@ -11,10 +11,11 @@ use crate::jmap::Jmap;
 use crate::jmap::protocol::check_response;
 use crate::schema::resolve;
 use crate::schema::{
-    FieldType, Fields, MapValueType, ObjectSchema, ObjectType, ScalarType, Schema, StringFormat,
+    FieldType, FieldUpdate, Fields, MapValueType, ObjectSchema, ObjectType, ScalarType, Schema,
+    StringFormat,
 };
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -60,8 +61,11 @@ pub fn run(ctx: &Context, args: &SnapshotArgs) -> CliResult<()> {
 
     let mut cache = FetchCache::new();
     for shard in plan.iter_non_singletons() {
-        emit_create(&mut sink, &snap_ctx, shard, &mut cache, &mut reporter)?;
+        let deferred = plan.deferred_for(&shard.key);
+        emit_create(&mut sink, &snap_ctx, shard, &deferred, &mut cache, &mut reporter)?;
     }
+
+    emit_deferred_updates(&mut sink, &snap_ctx, &plan, &mut cache)?;
 
     for name in plan.singletons() {
         emit_singleton_update(&mut sink, &snap_ctx, name, &mut reporter)?;
@@ -114,7 +118,7 @@ fn canonicalise_allow(schema: &Schema, raws: &[String]) -> CliResult<HashSet<Str
     Ok(out)
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct ShardKey {
     canonical: String,
     variant: Option<String>,
@@ -128,6 +132,14 @@ struct Shard {
 struct Plan {
     shards: Vec<Shard>,
     singletons: Vec<String>,
+    deferred: Vec<DeferredEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredEdge {
+    from_shard: ShardKey,
+    to_shard: ShardKey,
+    field: String,
 }
 
 impl Plan {
@@ -136,6 +148,12 @@ impl Plan {
     }
     fn singletons(&self) -> &[String] {
         &self.singletons
+    }
+    fn deferred_for(&self, key: &ShardKey) -> Vec<&DeferredEdge> {
+        self.deferred
+            .iter()
+            .filter(|d| &d.from_shard == key)
+            .collect()
     }
 }
 
@@ -183,62 +201,49 @@ fn build_plan(schema: &Schema, selection: &[String]) -> CliResult<Plan> {
         }
     }
 
-    topologically_sort(schema, &mut shards)?;
-    Ok(Plan { shards, singletons })
+    let deferred = topologically_sort(schema, &mut shards)?;
+    Ok(Plan {
+        shards,
+        singletons,
+        deferred,
+    })
 }
 
-fn topologically_sort(schema: &Schema, shards: &mut Vec<Shard>) -> CliResult<()> {
+fn topologically_sort(schema: &Schema, shards: &mut Vec<Shard>) -> CliResult<Vec<DeferredEdge>> {
     let index: HashMap<ShardKey, usize> = shards
         .iter()
         .enumerate()
         .map(|(i, s)| (s.key.clone(), i))
         .collect();
 
-    let mut deps: Vec<HashSet<usize>> = vec![HashSet::new(); shards.len()];
-    for (i, shard) in shards.iter().enumerate() {
-        let fields = shard_fields(schema, &shard.key);
-        if let Some(f) = fields {
-            let mut refs: Vec<ShardKey> = Vec::new();
-            let mut visited: HashSet<String> = HashSet::new();
-            collect_shard_refs(schema, f, &mut refs, &mut visited);
-            for r in refs {
-                if let Some(&j) = index.get(&r)
-                    && j != i
-                {
-                    deps[i].insert(j);
-                }
-            }
-        }
-    }
-
     let n = shards.len();
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    let mut ready: Vec<usize> = (0..n).filter(|&i| deps[i].is_empty()).collect();
-
-    while let Some(i) = ready.pop() {
-        order.push(i);
-        for (j, dep) in deps.iter_mut().enumerate() {
-            if dep.remove(&i) && dep.is_empty() {
-                ready.push(j);
+    let mut edges: Vec<BTreeMap<usize, EdgeFields>> = (0..n).map(|_| BTreeMap::new()).collect();
+    for (i, shard) in shards.iter().enumerate() {
+        let Some(fields) = shard_fields(schema, &shard.key) else {
+            continue;
+        };
+        let mut top_refs: Vec<TopRef> = Vec::new();
+        collect_top_refs(schema, fields, &mut top_refs);
+        for tr in top_refs {
+            let Some(&j) = index.get(&tr.target) else {
+                continue;
+            };
+            if j == i {
+                continue;
             }
+            edges[i]
+                .entry(j)
+                .or_default()
+                .add(tr.field, tr.mutable, tr.multi);
         }
     }
 
+    let deferred = break_cycles(shards, &mut edges)?;
+    let order = topo_order(&edges, n);
     if order.len() != n {
-        let cycle: Vec<String> = (0..n)
-            .filter(|&j| !deps[j].is_empty())
-            .map(|j| {
-                let k = &shards[j].key;
-                match &k.variant {
-                    Some(v) => format!("{}/{}", resolve::display_name(&k.canonical), v),
-                    None => resolve::display_name(&k.canonical).to_string(),
-                }
-            })
-            .collect();
-        return Err(CliError::msg(format!(
-            "cannot snapshot: cyclic dependency between the selected types ({})",
-            cycle.join(", ")
-        )));
+        return Err(CliError::msg(
+            "cannot snapshot: dependency graph still has cycles after cycle-breaking",
+        ));
     }
 
     let mut taken: Vec<Option<Shard>> = shards.drain(..).map(Some).collect();
@@ -247,7 +252,357 @@ fn topologically_sort(schema: &Schema, shards: &mut Vec<Shard>) -> CliResult<()>
             shards.push(s);
         }
     }
-    Ok(())
+    Ok(deferred)
+}
+
+#[derive(Default, Debug, Clone)]
+struct EdgeFields {
+    fields: Vec<EdgeField>,
+}
+
+#[derive(Debug, Clone)]
+struct EdgeField {
+    name: String,
+    mutable: bool,
+    multi: bool,
+}
+
+impl EdgeFields {
+    fn add(&mut self, name: String, mutable: bool, multi: bool) {
+        if !self.fields.iter().any(|f| f.name == name) {
+            self.fields.push(EdgeField {
+                name,
+                mutable,
+                multi,
+            });
+        }
+    }
+    fn pick_mutable(&self) -> Option<&EdgeField> {
+        let mut chosen: Option<&EdgeField> = None;
+        for f in &self.fields {
+            if !f.mutable {
+                continue;
+            }
+            match &chosen {
+                None => chosen = Some(f),
+                Some(c) if !c.multi && f.multi => chosen = Some(f),
+                _ => {}
+            }
+        }
+        chosen
+    }
+    fn any_immutable(&self) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|f| !f.mutable)
+            .map(|f| f.name.as_str())
+    }
+}
+
+struct TopRef {
+    field: String,
+    mutable: bool,
+    multi: bool,
+    target: ShardKey,
+}
+
+fn collect_top_refs(schema: &Schema, fields: &Fields, out: &mut Vec<TopRef>) {
+    for (name, field) in &fields.properties {
+        let mutable = matches!(field.update, FieldUpdate::Mutable);
+        let mut targets: Vec<(ShardKey, bool)> = Vec::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        collect_ft_refs_multi(schema, &field.typ, false, &mut targets, &mut visited);
+        for (target, multi) in targets {
+            out.push(TopRef {
+                field: name.clone(),
+                mutable,
+                multi,
+                target,
+            });
+        }
+    }
+}
+
+fn collect_ft_refs_multi(
+    schema: &Schema,
+    t: &FieldType,
+    multi: bool,
+    out: &mut Vec<(ShardKey, bool)>,
+    visited: &mut HashSet<String>,
+) {
+    match t {
+        FieldType::ObjectId { object_name, .. } => push_shard_refs_multi(schema, object_name, multi, out),
+        FieldType::Set {
+            class: ScalarType::ObjectId { object_name },
+            ..
+        } => push_shard_refs_multi(schema, object_name, true, out),
+        FieldType::Map {
+            key_class,
+            value_class,
+            ..
+        } => {
+            if let ScalarType::ObjectId { object_name } = key_class {
+                push_shard_refs_multi(schema, object_name, true, out);
+            }
+            if let MapValueType::Object { object_name } = value_class {
+                recurse_embedded_multi(schema, object_name, true, out, visited);
+            }
+        }
+        FieldType::Object { object_name, .. } => {
+            recurse_embedded_multi(schema, object_name, multi, out, visited);
+        }
+        FieldType::ObjectList { object_name, .. } => {
+            recurse_embedded_multi(schema, object_name, true, out, visited);
+        }
+        _ => {}
+    }
+}
+
+fn push_shard_refs_multi(
+    schema: &Schema,
+    object_name: &str,
+    multi: bool,
+    out: &mut Vec<(ShardKey, bool)>,
+) {
+    let mut tmp: Vec<ShardKey> = Vec::new();
+    push_shard_refs(schema, object_name, &mut tmp);
+    for k in tmp {
+        out.push((k, multi));
+    }
+}
+
+fn recurse_embedded_multi(
+    schema: &Schema,
+    object_name: &str,
+    multi: bool,
+    out: &mut Vec<(ShardKey, bool)>,
+    visited: &mut HashSet<String>,
+) {
+    if !visited.insert(object_name.to_string()) {
+        return;
+    }
+    let Some(obj_schema) = schema.schemas.get(object_name) else {
+        return;
+    };
+    match obj_schema {
+        ObjectSchema::Single { schema_name } => {
+            if let Some(f) = schema.fields.get(schema_name) {
+                for fld in f.properties.values() {
+                    collect_ft_refs_multi(schema, &fld.typ, multi, out, visited);
+                }
+            }
+        }
+        ObjectSchema::Multiple { variants } => {
+            for v in variants {
+                if let Some(sn) = &v.schema_name
+                    && let Some(f) = schema.fields.get(sn)
+                {
+                    for fld in f.properties.values() {
+                        collect_ft_refs_multi(schema, &fld.typ, multi, out, visited);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn topo_order(edges: &[BTreeMap<usize, EdgeFields>], n: usize) -> Vec<usize> {
+    let mut deps: Vec<HashSet<usize>> = (0..n).map(|i| edges[i].keys().copied().collect()).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut ready: Vec<usize> = (0..n).filter(|&i| deps[i].is_empty()).collect();
+    while let Some(i) = ready.pop() {
+        order.push(i);
+        for (j, dep) in deps.iter_mut().enumerate() {
+            if dep.remove(&i) && dep.is_empty() {
+                ready.push(j);
+            }
+        }
+    }
+    order
+}
+
+fn break_cycles(
+    shards: &[Shard],
+    edges: &mut [BTreeMap<usize, EdgeFields>],
+) -> CliResult<Vec<DeferredEdge>> {
+    let mut deferred: Vec<DeferredEdge> = Vec::new();
+    loop {
+        let sccs = tarjan_sccs(edges);
+        let mut progressed = false;
+        for scc in sccs {
+            if scc.len() == 1 {
+                let v = scc[0];
+                if !edges[v].contains_key(&v) {
+                    continue;
+                }
+            }
+            let scc_set: HashSet<usize> = scc.iter().copied().collect();
+            let mut sorted_scc: Vec<usize> = scc.to_vec();
+            sorted_scc.sort_by(|&a, &b| {
+                display_shard(&shards[a].key).cmp(&display_shard(&shards[b].key))
+            });
+
+            #[derive(Clone)]
+            struct Candidate {
+                u: usize,
+                v: usize,
+                field: String,
+                multi: bool,
+            }
+            let mut best: Option<Candidate> = None;
+            for &u in &sorted_scc {
+                let Some(targets) = edges.get(u) else { continue };
+                for (&v, ef) in targets.iter() {
+                    if !scc_set.contains(&v) {
+                        continue;
+                    }
+                    if let Some(f) = ef.pick_mutable() {
+                        let cand = Candidate {
+                            u,
+                            v,
+                            field: f.name.clone(),
+                            multi: f.multi,
+                        };
+                        let take = match &best {
+                            None => true,
+                            Some(b) => !b.multi && cand.multi,
+                        };
+                        if take {
+                            best = Some(cand);
+                        }
+                    }
+                }
+            }
+            let chosen = best.map(|c| (c.u, c.v, c.field));
+            let Some((u, v, field)) = chosen else {
+                let mut nodes: Vec<String> = scc
+                    .iter()
+                    .map(|&i| display_shard(&shards[i].key))
+                    .collect();
+                nodes.sort();
+                let mut immutable_hint: Option<String> = None;
+                'find_imm: for &u in &scc {
+                    let Some(targets) = edges.get(u) else {
+                        continue;
+                    };
+                    for (&v, ef) in targets.iter() {
+                        if !scc_set.contains(&v) {
+                            continue;
+                        }
+                        if let Some(name) = ef.any_immutable() {
+                            immutable_hint = Some(format!(
+                                "{}.{} -> {}",
+                                display_shard(&shards[u].key),
+                                name,
+                                display_shard(&shards[v].key)
+                            ));
+                            break 'find_imm;
+                        }
+                    }
+                }
+                let mut msg = String::from(
+                    "cannot snapshot: cyclic dependency between selected types: ",
+                );
+                msg.push_str(&nodes.join(", "));
+                if let Some(h) = immutable_hint {
+                    msg.push_str(" (immutable field closes the cycle: ");
+                    msg.push_str(&h);
+                    msg.push(')');
+                }
+                return Err(CliError::msg(msg));
+            };
+            if let Some(targets) = edges.get_mut(u)
+                && let Some(ef) = targets.get_mut(&v)
+            {
+                ef.fields.retain(|f| f.name != field);
+                if ef.fields.is_empty() {
+                    targets.remove(&v);
+                }
+            }
+            deferred.push(DeferredEdge {
+                from_shard: shards[u].key.clone(),
+                to_shard: shards[v].key.clone(),
+                field,
+            });
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    Ok(deferred)
+}
+
+fn tarjan_sccs(edges: &[BTreeMap<usize, EdgeFields>]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let adj: Vec<Vec<usize>> = edges.iter().map(|m| m.keys().copied().collect()).collect();
+
+    let mut indices: Vec<i64> = vec![-1; n];
+    let mut lowlink: Vec<usize> = vec![0; n];
+    let mut on_stack: Vec<bool> = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next_index: usize = 0;
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    for v in 0..n {
+        if indices[v] >= 0 {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = Vec::new();
+        indices[v] = next_index as i64;
+        lowlink[v] = next_index;
+        next_index += 1;
+        stack.push(v);
+        on_stack[v] = true;
+        work.push((v, 0));
+        while let Some((u, i)) = work.last().copied() {
+            if i < adj[u].len() {
+                let w = adj[u][i];
+                if let Some(slot) = work.last_mut() {
+                    slot.1 = i + 1;
+                }
+                if indices[w] < 0 {
+                    indices[w] = next_index as i64;
+                    lowlink[w] = next_index;
+                    next_index += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    let wi = indices[w] as usize;
+                    if wi < lowlink[u] {
+                        lowlink[u] = wi;
+                    }
+                }
+            } else {
+                work.pop();
+                if let Some(&(parent, _)) = work.last()
+                    && lowlink[u] < lowlink[parent]
+                {
+                    lowlink[parent] = lowlink[u];
+                }
+                if (lowlink[u] as i64) == indices[u] {
+                    let mut comp: Vec<usize> = Vec::new();
+                    while let Some(node) = stack.pop() {
+                        on_stack[node] = false;
+                        comp.push(node);
+                        if node == u {
+                            break;
+                        }
+                    }
+                    sccs.push(comp);
+                }
+            }
+        }
+    }
+    sccs
+}
+
+fn display_shard(key: &ShardKey) -> String {
+    match &key.variant {
+        Some(v) => format!("{}/{}", resolve::display_name(&key.canonical), v),
+        None => resolve::display_name(&key.canonical).to_string(),
+    }
 }
 
 fn shard_fields<'a>(schema: &'a Schema, key: &ShardKey) -> Option<&'a Fields> {
@@ -416,18 +771,95 @@ fn validate_static_refs(
                 {
                     continue;
                 }
+                let from = resolve::display_name(canonical);
+                let to = resolve::display_name(&r.canonical);
+                let creates_cycle =
+                    adding_target_creates_cycle(schema, &selected, canonical, &r.canonical);
+                let recommendation = if creates_cycle {
+                    format!(
+                        "adding {to} to the selection would form a cycle, so use \
+                         --allow-unresolved {to}"
+                    )
+                } else {
+                    format!("add {to} to the selection, or use --allow-unresolved {to}")
+                };
                 return Err(CliError::msg(format!(
-                    "{} references {} but {} is not in the snapshot selection; \
-                     add it or use --allow-unresolved {}",
-                    resolve::display_name(canonical),
-                    resolve::display_name(&r.canonical),
-                    resolve::display_name(&r.canonical),
-                    resolve::display_name(&r.canonical),
+                    "{from} references {to} but {to} is not in the snapshot selection; \
+                     {recommendation}"
                 )));
             }
         }
     }
     Ok(())
+}
+
+fn adding_target_creates_cycle(
+    schema: &Schema,
+    selected: &HashSet<&str>,
+    from: &str,
+    target: &str,
+) -> bool {
+    let mut universe: Vec<String> = selected.iter().map(|s| s.to_string()).collect();
+    if !universe.iter().any(|s| s == target) {
+        universe.push(target.to_string());
+    }
+    if !universe.iter().any(|s| s == from) {
+        universe.push(from.to_string());
+    }
+    let universe_set: HashSet<&str> = universe.iter().map(String::as_str).collect();
+    let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+    for name in &universe {
+        let outgoing = canonical_refs(schema, name);
+        let entry = adj.entry(name.clone()).or_default();
+        for tgt in outgoing {
+            if universe_set.contains(tgt.as_str()) && tgt != *name {
+                entry.insert(tgt);
+            }
+        }
+    }
+    let mut stack = vec![target.to_string()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if let Some(neighbors) = adj.get(&node) {
+            for n in neighbors {
+                if n == target {
+                    return true;
+                }
+                stack.push(n.clone());
+            }
+        }
+    }
+    false
+}
+
+fn canonical_refs(schema: &Schema, canonical: &str) -> Vec<String> {
+    let mut out: Vec<ShardKey> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let obj_schema = schema.schemas.get(canonical);
+    match obj_schema {
+        Some(ObjectSchema::Single { schema_name }) => {
+            if let Some(f) = schema.fields.get(schema_name) {
+                collect_shard_refs(schema, f, &mut out, &mut visited);
+            }
+        }
+        Some(ObjectSchema::Multiple { variants }) => {
+            for v in variants {
+                if let Some(sn) = v.schema_name.as_ref()
+                    && let Some(f) = schema.fields.get(sn)
+                {
+                    collect_shard_refs(schema, f, &mut out, &mut visited);
+                }
+            }
+        }
+        None => {}
+    }
+    let mut canonicals: Vec<String> = out.into_iter().map(|k| k.canonical).collect();
+    canonicals.sort();
+    canonicals.dedup();
+    canonicals
 }
 
 fn emit_destroy<W: Write>(sink: &mut W, canonical: &str) -> CliResult<()> {
@@ -441,6 +873,7 @@ fn emit_create<W: Write>(
     sink: &mut W,
     cx: &Ctx<'_>,
     shard: &Shard,
+    deferred: &[&DeferredEdge],
     cache: &mut FetchCache,
     reporter: &mut Reporter,
 ) -> CliResult<()> {
@@ -459,6 +892,8 @@ fn emit_create<W: Write>(
         return Ok(());
     }
 
+    let omit: HashSet<&str> = deferred.iter().map(|d| d.field.as_str()).collect();
+
     sink.write_all(b"{\"@type\":\"create\",\"object\":\"")?;
     sink.write_all(resolve::display_name(&shard.key.canonical).as_bytes())?;
     sink.write_all(b"\",\"value\":{")?;
@@ -476,6 +911,9 @@ fn emit_create<W: Write>(
         {
             out_obj.insert("@type".into(), at_type.clone());
         }
+        for k in &omit {
+            out_obj.remove(*k);
+        }
 
         if !first_entry {
             sink.write_all(b",")?;
@@ -490,6 +928,56 @@ fn emit_create<W: Write>(
 
     sink.write_all(b"}}\n")?;
     reporter.shard_done(&shard.key, total);
+    Ok(())
+}
+
+fn emit_deferred_updates<W: Write>(
+    sink: &mut W,
+    cx: &Ctx<'_>,
+    plan: &Plan,
+    cache: &mut FetchCache,
+) -> CliResult<()> {
+    let mut by_shard: Vec<(&ShardKey, Vec<&DeferredEdge>)> = Vec::new();
+    for edge in &plan.deferred {
+        if let Some(slot) = by_shard.iter_mut().find(|(k, _)| *k == &edge.from_shard) {
+            slot.1.push(edge);
+        } else {
+            by_shard.push((&edge.from_shard, vec![edge]));
+        }
+    }
+    for (key, edges) in by_shard {
+        let Some(fields) = shard_fields(cx.schema, key) else {
+            continue;
+        };
+        let objs = cache.objects_for(key);
+        if objs.is_empty() {
+            continue;
+        }
+        let field_names: HashSet<&str> = edges.iter().map(|e| e.field.as_str()).collect();
+        for obj in objs {
+            let Some(server_id) = obj.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut patch = Map::new();
+            let transformed =
+                transform_object(cx.schema, fields, obj, cx.allow, cx.include_secrets);
+            for name in &field_names {
+                if let Some(v) = transformed.get(*name) {
+                    patch.insert((*name).to_string(), v.clone());
+                }
+            }
+            if patch.is_empty() {
+                continue;
+            }
+            sink.write_all(b"{\"@type\":\"update\",\"object\":\"")?;
+            sink.write_all(resolve::display_name(&key.canonical).as_bytes())?;
+            sink.write_all(b"\",\"id\":\"#")?;
+            write_client_id(sink, &key.canonical, server_id)?;
+            sink.write_all(b"\",\"value\":")?;
+            serde_json::to_writer(&mut *sink, &Value::Object(patch))?;
+            sink.write_all(b"}\n")?;
+        }
+    }
     Ok(())
 }
 
@@ -1028,5 +1516,347 @@ mod tests {
         );
         let err = resolve_selection(&s, &["account/user".to_string()]).unwrap_err();
         assert!(format!("{err}").contains("cannot select variants"));
+    }
+
+    fn obj_type() -> ObjectType {
+        ObjectType::Object {
+            description: "".into(),
+            permission_prefix: "".into(),
+            enterprise: false,
+        }
+    }
+
+    fn objid_field(object_name: &str, mutable: bool) -> crate::schema::Field {
+        crate::schema::Field {
+            description: "".into(),
+            typ: FieldType::ObjectId {
+                object_name: object_name.into(),
+                nullable: true,
+            },
+            update: if mutable {
+                FieldUpdate::Mutable
+            } else {
+                FieldUpdate::Immutable
+            },
+            enterprise: false,
+        }
+    }
+
+    fn set_objid_field(object_name: &str, mutable: bool) -> crate::schema::Field {
+        crate::schema::Field {
+            description: "".into(),
+            typ: FieldType::Set {
+                class: ScalarType::ObjectId {
+                    object_name: object_name.into(),
+                },
+                min_items: None,
+                max_items: None,
+            },
+            update: if mutable {
+                FieldUpdate::Mutable
+            } else {
+                FieldUpdate::Immutable
+            },
+            enterprise: false,
+        }
+    }
+
+    fn single_obj(schema_name: &str) -> ObjectSchema {
+        ObjectSchema::Single {
+            schema_name: schema_name.into(),
+        }
+    }
+
+    fn fields_with(properties: Vec<(&str, crate::schema::Field)>) -> Fields {
+        let mut props: HashMap<String, crate::schema::Field> = HashMap::new();
+        for (k, v) in properties {
+            props.insert(k.into(), v);
+        }
+        Fields {
+            properties: props,
+            defaults: HashMap::new(),
+        }
+    }
+
+    fn tenant_role_schema(role_to_tenant_mutable: bool, tenant_to_role_mutable: bool) -> Schema {
+        let mut s = Schema::default();
+        s.objects.insert("x:Tenant".into(), obj_type());
+        s.objects.insert("x:Role".into(), obj_type());
+        s.schemas.insert("x:Tenant".into(), single_obj("x:Tenant"));
+        s.schemas.insert("x:Role".into(), single_obj("x:Role"));
+        s.fields.insert(
+            "x:Tenant".into(),
+            fields_with(vec![(
+                "roles",
+                set_objid_field("x:Role", tenant_to_role_mutable),
+            )]),
+        );
+        s.fields.insert(
+            "x:Role".into(),
+            fields_with(vec![(
+                "memberTenantId",
+                objid_field("x:Tenant", role_to_tenant_mutable),
+            )]),
+        );
+        s
+    }
+
+    #[test]
+    fn validate_recommends_allow_unresolved_when_adding_target_creates_cycle() {
+        let s = tenant_role_schema(true, true);
+        let selection = vec!["x:Tenant".to_string()];
+        let err =
+            validate_static_refs(&s, &selection, &HashSet::new()).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--allow-unresolved Role"),
+            "expected --allow-unresolved Role suggestion, got: {msg}"
+        );
+        assert!(
+            msg.contains("cycle"),
+            "expected mention of cycle, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_recommends_adding_target_when_no_cycle() {
+        let mut s = Schema::default();
+        s.objects.insert("x:A".into(), obj_type());
+        s.objects.insert("x:B".into(), obj_type());
+        s.schemas.insert("x:A".into(), single_obj("x:A"));
+        s.schemas.insert("x:B".into(), single_obj("x:B"));
+        s.fields.insert(
+            "x:A".into(),
+            fields_with(vec![("bid", objid_field("x:B", true))]),
+        );
+        s.fields.insert("x:B".into(), fields_with(vec![]));
+        let err = validate_static_refs(&s, &["x:A".to_string()], &HashSet::new())
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("add B to the selection"),
+            "expected add B suggestion, got: {msg}"
+        );
+        assert!(
+            !msg.contains("would form a cycle"),
+            "expected no cycle text, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn topo_sort_breaks_tenant_role_cycle_via_mutable_edge() {
+        let s = tenant_role_schema(true, true);
+        let mut shards = vec![
+            Shard {
+                key: ShardKey {
+                    canonical: "x:Tenant".into(),
+                    variant: None,
+                },
+                is_singleton: false,
+            },
+            Shard {
+                key: ShardKey {
+                    canonical: "x:Role".into(),
+                    variant: None,
+                },
+                is_singleton: false,
+            },
+        ];
+        let deferred = topologically_sort(&s, &mut shards).expect("must succeed");
+        assert_eq!(
+            deferred.len(),
+            1,
+            "expected exactly one deferred edge: {deferred:?}"
+        );
+        let edge = &deferred[0];
+        assert_eq!(edge.from_shard.canonical, "x:Tenant");
+        assert_eq!(edge.to_shard.canonical, "x:Role");
+        assert_eq!(edge.field, "roles");
+        let names: Vec<&str> = shards.iter().map(|s| s.key.canonical.as_str()).collect();
+        assert_eq!(names, vec!["x:Tenant", "x:Role"]);
+    }
+
+    #[test]
+    fn topo_sort_errors_with_only_scc_nodes_when_immutable_cycle() {
+        let mut s = tenant_role_schema(false, false);
+        s.objects.insert("x:Domain".into(), obj_type());
+        s.schemas.insert("x:Domain".into(), single_obj("x:Domain"));
+        s.fields.insert(
+            "x:Domain".into(),
+            fields_with(vec![("memberTenantId", objid_field("x:Tenant", true))]),
+        );
+        let mut shards = vec![
+            Shard {
+                key: ShardKey {
+                    canonical: "x:Tenant".into(),
+                    variant: None,
+                },
+                is_singleton: false,
+            },
+            Shard {
+                key: ShardKey {
+                    canonical: "x:Role".into(),
+                    variant: None,
+                },
+                is_singleton: false,
+            },
+            Shard {
+                key: ShardKey {
+                    canonical: "x:Domain".into(),
+                    variant: None,
+                },
+                is_singleton: false,
+            },
+        ];
+        let err = topologically_sort(&s, &mut shards).expect_err("expected cycle error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Tenant") && msg.contains("Role"),
+            "expected Tenant and Role in: {msg}"
+        );
+        assert!(
+            !msg.contains("Domain"),
+            "Domain should not appear in cycle list: {msg}"
+        );
+        assert!(
+            msg.contains("immutable"),
+            "expected mention of immutable field: {msg}"
+        );
+    }
+
+    #[test]
+    fn emit_create_omits_deferred_field_and_emits_followup_update() {
+        let s = tenant_role_schema(true, true);
+        let plan = Plan {
+            shards: vec![
+                Shard {
+                    key: ShardKey {
+                        canonical: "x:Tenant".into(),
+                        variant: None,
+                    },
+                    is_singleton: false,
+                },
+                Shard {
+                    key: ShardKey {
+                        canonical: "x:Role".into(),
+                        variant: None,
+                    },
+                    is_singleton: false,
+                },
+            ],
+            singletons: vec![],
+            deferred: vec![DeferredEdge {
+                from_shard: ShardKey {
+                    canonical: "x:Tenant".into(),
+                    variant: None,
+                },
+                to_shard: ShardKey {
+                    canonical: "x:Role".into(),
+                    variant: None,
+                },
+                field: "roles".into(),
+            }],
+        };
+
+        let mut tenant_groups: VariantGroups = HashMap::new();
+        let mut tenant = Map::new();
+        tenant.insert("id".into(), Value::String("t1".into()));
+        tenant.insert(
+            "roles".into(),
+            json!({"r1": true})
+                .as_object()
+                .map(|m| Value::Object(m.clone()))
+                .unwrap_or(Value::Null),
+        );
+        tenant_groups.entry(None).or_default().push(tenant);
+
+        let mut role_groups: VariantGroups = HashMap::new();
+        let mut role = Map::new();
+        role.insert("id".into(), Value::String("r1".into()));
+        role.insert("memberTenantId".into(), Value::String("t1".into()));
+        role_groups.entry(None).or_default().push(role);
+
+        let mut cache = FetchCache::new();
+        cache.by_canonical.insert("x:Tenant".into(), tenant_groups);
+        cache.by_canonical.insert("x:Role".into(), role_groups);
+
+        let allow: HashSet<String> = HashSet::new();
+        let cfg = crate::app::config::Config {
+            url: "http://localhost".into(),
+            auth: crate::app::config::AuthMode::Bearer {
+                token: "x".into(),
+            },
+            insecure: false,
+            color: false,
+        };
+        let http = crate::jmap::http::HttpClient::new(&cfg).unwrap();
+        let jmap = Jmap::new(&http, "/");
+        let cx = Ctx {
+            jmap: &jmap,
+            schema: &s,
+            allow: &allow,
+            include_secrets: false,
+            limit: 100,
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut sink: &mut dyn Write = &mut buf;
+            let mut reporter = Reporter::new(true);
+            for shard in plan.iter_non_singletons() {
+                let deferred = plan.deferred_for(&shard.key);
+                emit_create(
+                    &mut sink,
+                    &cx,
+                    shard,
+                    &deferred,
+                    &mut cache,
+                    &mut reporter,
+                )
+                .unwrap();
+            }
+            emit_deferred_updates(&mut sink, &cx, &plan, &mut cache).unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "expected 3 ndjson lines, got: {output}");
+
+        let create_tenant: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(create_tenant.get("@type"), Some(&Value::String("create".into())));
+        assert_eq!(create_tenant.get("object"), Some(&Value::String("Tenant".into())));
+        let value = create_tenant
+            .get("value")
+            .and_then(Value::as_object)
+            .unwrap();
+        let tenant_obj = value.values().next().and_then(Value::as_object).unwrap();
+        assert!(
+            !tenant_obj.contains_key("roles"),
+            "expected `roles` to be omitted from create body, got: {tenant_obj:?}"
+        );
+
+        let create_role: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(create_role.get("@type"), Some(&Value::String("create".into())));
+        assert_eq!(create_role.get("object"), Some(&Value::String("Role".into())));
+
+        let update_tenant: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(update_tenant.get("@type"), Some(&Value::String("update".into())));
+        assert_eq!(update_tenant.get("object"), Some(&Value::String("Tenant".into())));
+        let id = update_tenant.get("id").and_then(Value::as_str).unwrap();
+        assert!(
+            id.starts_with("#tenant-"),
+            "expected `#tenant-...` id, got `{id}`"
+        );
+        let val = update_tenant
+            .get("value")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(val.len(), 1);
+        assert!(val.contains_key("roles"), "expected `roles` in update body");
+        let roles = val.get("roles").and_then(Value::as_object).unwrap();
+        let key = roles.keys().next().unwrap();
+        assert!(
+            key.starts_with("#role-"),
+            "expected role id to be `#role-...`, got `{key}`"
+        );
     }
 }
