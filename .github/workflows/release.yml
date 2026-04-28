@@ -160,54 +160,6 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
-  extra-targets:
-    name: Build / ${{ matrix.target }}
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: write
-      attestations: write
-    needs: [host]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: armv7-unknown-linux-gnueabihf
-            name: armv7-gnu
-          - target: armv7-unknown-linux-musleabihf
-            name: armv7-musl
-          - target: arm-unknown-linux-gnueabihf
-            name: arm-gnu
-          - target: arm-unknown-linux-musleabihf
-            name: arm-musl
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Build
-        uses: houseabsolute/actions-rust-cross@v1
-        with:
-          command: build
-          target: ${{ matrix.target }}
-          args: --release --locked
-
-      - name: Compress
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar -czf stalwart-cli-${{ matrix.name }}.tar.gz stalwart-cli
-
-      - name: Attest binary
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: target/${{ matrix.target }}/release/stalwart-cli-${{ matrix.name }}.tar.gz
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: target/${{ matrix.target }}/release/stalwart-cli-${{ matrix.name }}.tar.gz
-          draft: true
-
-
   host:
     needs:
       - plan
@@ -318,8 +270,7 @@ jobs:
       - plan
       - host
       - publish-homebrew-formula
-      - extra-targets
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') && (needs.extra-targets.result == 'skipped' || needs.extra-targets.result == 'success') }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -337,7 +288,6 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-      - extra-targets
       - host
       - publish-homebrew-formula
       - announce

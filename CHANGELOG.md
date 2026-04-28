@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.4] - 2026-04-28
+
+### Added
+- `aarch64-unknown-linux-musl` target.
+
+### Changed
+
+### Fixed
+
 ## [1.0.3] - 2026-04-27
 
 ### Added
