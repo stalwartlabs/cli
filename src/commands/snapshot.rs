@@ -1348,7 +1348,14 @@ fn transform_embedded(
         ObjectSchema::Multiple { variants } => {
             let at_type = map.get("@type").and_then(Value::as_str)?;
             let v = variants.iter().find(|v| v.name == at_type)?;
-            schema.fields.get(v.schema_name.as_ref()?)?
+            match v.schema_name.as_ref().and_then(|n| schema.fields.get(n)) {
+                Some(f) => f,
+                None => {
+                    let mut out = Map::with_capacity(1);
+                    out.insert("@type".into(), Value::String(at_type.to_string()));
+                    return Some(Value::Object(out));
+                }
+            }
         }
     };
     let mut out = Map::with_capacity(map.len());
@@ -1857,6 +1864,65 @@ mod tests {
         assert!(
             key.starts_with("#role-"),
             "expected role id to be `#role-...`, got `{key}`"
+        );
+    }
+
+    #[test]
+    fn transform_embedded_preserves_marker_only_variant() {
+        use crate::schema::{Field, FieldType, FieldUpdate, Fields, ObjectVariant};
+        let mut s = Schema::default();
+        s.schemas.insert(
+            "x:DkimManagement".into(),
+            ObjectSchema::Multiple {
+                variants: vec![
+                    ObjectVariant {
+                        name: "Automatic".into(),
+                        label: "".into(),
+                        schema_name: Some("x:DkimManagementProperties".into()),
+                    },
+                    ObjectVariant {
+                        name: "Manual".into(),
+                        label: "".into(),
+                        schema_name: None,
+                    },
+                ],
+            },
+        );
+        let mut props: HashMap<String, Field> = HashMap::new();
+        props.insert(
+            "selectorTemplate".into(),
+            Field {
+                description: "".into(),
+                typ: FieldType::String {
+                    format: StringFormat::String,
+                    min_length: None,
+                    max_length: None,
+                    nullable: false,
+                },
+                update: FieldUpdate::Mutable,
+                enterprise: false,
+            },
+        );
+        s.fields.insert(
+            "x:DkimManagementProperties".into(),
+            Fields {
+                properties: props,
+                defaults: HashMap::new(),
+            },
+        );
+
+        let manual = json!({"@type": "Manual"});
+        let allow: HashSet<String> = HashSet::new();
+        let out = transform_embedded(&s, "x:DkimManagement", manual, &allow, false)
+            .expect("manual variant must round-trip");
+        assert_eq!(out, json!({"@type": "Manual"}));
+
+        let auto = json!({"@type": "Automatic", "selectorTemplate": "v{version}"});
+        let out = transform_embedded(&s, "x:DkimManagement", auto, &allow, false)
+            .expect("automatic variant must round-trip");
+        assert_eq!(
+            out,
+            json!({"@type": "Automatic", "selectorTemplate": "v{version}"})
         );
     }
 }
