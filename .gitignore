@@ -4,6 +4,8 @@ target
 *.pdb
 **/mutants.out*/
 *.md
+.*
+!.gitignore
 !CHANGELOG.md
 !README.md
 
