@@ -42,9 +42,12 @@ pub fn build_input(
         active += 1;
     }
     if active == 0 {
-        return Err(CliError::msg(
-            "no input provided; use --field, --json, --file, or --stdin",
-        ));
+        let payloadless_create = matches!(mode, Mode::Create) && fields.properties.is_empty();
+        if !payloadless_create {
+            return Err(CliError::msg(
+                "no input provided; use --field, --json, --file, or --stdin",
+            ));
+        }
     }
     if active > 1 {
         return Err(CliError::msg(
@@ -302,6 +305,26 @@ mod tests {
         Fields::default()
     }
 
+    fn fields_with(name: &str) -> Fields {
+        use crate::schema::{Field, FieldType, FieldUpdate, StringFormat};
+        let mut f = Fields::default();
+        f.properties.insert(
+            name.to_string(),
+            Field {
+                description: String::new(),
+                typ: FieldType::String {
+                    format: StringFormat::String,
+                    min_length: None,
+                    max_length: None,
+                    nullable: false,
+                },
+                update: FieldUpdate::Mutable,
+                enterprise: false,
+            },
+        );
+        f
+    }
+
     #[test]
     fn split_kv_basic() {
         assert_eq!(split_kv("name=foo").unwrap(), ("name", "foo"));
@@ -377,13 +400,38 @@ mod tests {
     }
 
     #[test]
-    fn build_input_requires_at_least_one_source() {
+    fn build_input_requires_at_least_one_source_when_schema_has_fields() {
         let s = Sources {
             fields: &[],
             json: None,
             file: None,
             stdin: false,
         };
-        assert!(build_input(&s, &empty_fields(), Mode::Create).is_err());
+        let err = build_input(&s, &fields_with("name"), Mode::Create).unwrap_err();
+        assert!(format!("{err}").contains("no input provided"));
+    }
+
+    #[test]
+    fn build_input_allows_no_sources_for_payloadless_create() {
+        let s = Sources {
+            fields: &[],
+            json: None,
+            file: None,
+            stdin: false,
+        };
+        let out = build_input(&s, &empty_fields(), Mode::Create).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn build_input_still_requires_source_for_update_with_no_fields() {
+        let s = Sources {
+            fields: &[],
+            json: None,
+            file: None,
+            stdin: false,
+        };
+        let err = build_input(&s, &empty_fields(), Mode::Update).unwrap_err();
+        assert!(format!("{err}").contains("no input provided"));
     }
 }

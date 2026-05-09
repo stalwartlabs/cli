@@ -126,12 +126,16 @@ fn fields_for(
         ObjectSchema::Multiple { variants } => {
             if let Some(vn) = variant {
                 for v in variants {
-                    if v.name.eq_ignore_ascii_case(vn)
-                        && let Some(sn) = &v.schema_name
-                    {
-                        return Ok(schema.fields.get(sn).cloned().unwrap_or_default());
+                    if v.name.eq_ignore_ascii_case(vn) {
+                        return Ok(match &v.schema_name {
+                            Some(sn) => schema.fields.get(sn).cloned().unwrap_or_default(),
+                            None => Fields::default(),
+                        });
                     }
                 }
+                return Err(CliError::UnexpectedResponse(format!(
+                    "variant `{vn}` not found in {canonical}"
+                )));
             }
 
             let mut out = Fields::default();
@@ -164,5 +168,91 @@ fn walk_fields<'a>(
             let sn = v.schema_name.as_ref()?;
             schema.fields.get(sn)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{
+        Field, FieldType, FieldUpdate, ObjectVariant, Schema, StringFormat,
+    };
+    use std::collections::HashMap;
+
+    fn string_field() -> Field {
+        Field {
+            description: String::new(),
+            typ: FieldType::String {
+                format: StringFormat::String,
+                min_length: None,
+                max_length: None,
+                nullable: false,
+            },
+            update: FieldUpdate::Mutable,
+            enterprise: false,
+        }
+    }
+
+    fn action_schema() -> Schema {
+        let mut s = Schema::default();
+        s.schemas.insert(
+            "x:Action".into(),
+            ObjectSchema::Multiple {
+                variants: vec![
+                    ObjectVariant {
+                        name: "ReloadTlsCertificates".into(),
+                        label: "Reload TLS".into(),
+                        schema_name: None,
+                    },
+                    ObjectVariant {
+                        name: "ClassifySpam".into(),
+                        label: "Classify".into(),
+                        schema_name: Some("x:SpamClassify".into()),
+                    },
+                ],
+            },
+        );
+        let mut props: HashMap<String, Field> = HashMap::new();
+        props.insert("message".into(), string_field());
+        s.fields.insert(
+            "x:SpamClassify".into(),
+            Fields {
+                properties: props,
+                defaults: HashMap::new(),
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn fields_for_payloadless_variant_returns_empty() {
+        let schema = action_schema();
+        let f = fields_for(&schema, "x:Action", Some("ReloadTlsCertificates")).unwrap();
+        assert!(
+            f.properties.is_empty(),
+            "payloadless variant must not inherit fields from sibling variants"
+        );
+    }
+
+    #[test]
+    fn fields_for_payload_variant_returns_its_fields() {
+        let schema = action_schema();
+        let f = fields_for(&schema, "x:Action", Some("ClassifySpam")).unwrap();
+        assert!(f.properties.contains_key("message"));
+        assert_eq!(f.properties.len(), 1);
+    }
+
+    #[test]
+    fn fields_for_no_variant_merges_all_variants() {
+        let schema = action_schema();
+        let f = fields_for(&schema, "x:Action", None).unwrap();
+        assert!(f.properties.contains_key("message"));
+    }
+
+    #[test]
+    fn fields_for_unknown_variant_errors() {
+        let schema = action_schema();
+        let err = fields_for(&schema, "x:Action", Some("DoesNotExist")).unwrap_err();
+        assert!(format!("{err}").contains("DoesNotExist"));
     }
 }

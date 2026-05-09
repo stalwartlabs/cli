@@ -1,7 +1,7 @@
 [package]
 name = "stalwart-cli"
 description = "Stalwart CLI"
-version = "1.0.5"
+version = "1.0.6"
 authors = ["Stalwart Labs LLC <hello@stalw.art>"]
 license = "AGPL-3.0-only OR LicenseRef-SEL"
 repository = "https://github.com/stalwartlabs/cli"
@@ -24,7 +24,7 @@ dirs = "6"
 flate2 = "1.1.9"
 is-terminal = "0.4.17"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls", "json"] }
-rpassword = "7.4"
+rpassword = "7.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 sha2 = "0.11"

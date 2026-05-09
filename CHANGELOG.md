@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.6] - 2026-05-09
+
+### Added
+
+### Changed
+
+### Fixed
+- `create` on a multi-variant object whose selected variant carries no payload (#8).
+
 ## [1.0.5] - 2026-05-05
 
 ### Added
@@ -10,7 +19,6 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - `snapshot` drops embedded multi-variant fields whose value is a marker-only variant (#7).
-
 
 ## [1.0.4] - 2026-04-28
 
