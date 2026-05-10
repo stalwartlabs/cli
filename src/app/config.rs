@@ -13,6 +13,7 @@ pub struct Config {
     pub auth: AuthMode,
     pub insecure: bool,
     pub color: bool,
+    pub debug: bool,
 }
 
 pub enum AuthMode {
@@ -35,11 +36,15 @@ impl Config {
             && std::env::var_os("NO_COLOR").is_none()
             && std::io::stdout().is_terminal();
 
+        let debug = args.debug
+            || std::env::var_os("STALWART_DEBUG").is_some_and(|v| !v.is_empty());
+
         Ok(Config {
             url,
             auth,
             insecure: args.insecure,
             color,
+            debug,
         })
     }
 }

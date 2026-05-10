@@ -1795,6 +1795,7 @@ mod tests {
             },
             insecure: false,
             color: false,
+            debug: false,
         };
         let http = crate::jmap::http::HttpClient::new(&cfg).unwrap();
         let jmap = Jmap::new(&http, "/");

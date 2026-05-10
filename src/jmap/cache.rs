@@ -102,6 +102,15 @@ impl SchemaCache {
         Ok(())
     }
 
+    pub fn file_for_hash(&self, hash: &str) -> PathBuf {
+        self.file_for(hash)
+    }
+
+    pub fn invalidate(&self, hash: &str) {
+        let _ = fs::remove_file(self.dir.join("latest"));
+        let _ = fs::remove_file(self.file_for(hash));
+    }
+
     fn file_for(&self, hash: &str) -> PathBuf {
         self.dir.join(format!("schema-{}.json", hash))
     }

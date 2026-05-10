@@ -5,11 +5,15 @@ All notable changes to this project will be documented in this file. This projec
 ## [1.0.6] - 2026-05-09
 
 ### Added
+- `--debug` flag and `STALWART_DEBUG` env var to log HTTP traffic to stderr.
 
 ### Changed
+- Schema-fetch parse errors now include status, content-type, byte length, and a body snippet.
 
 ### Fixed
 - `create` on a multi-variant object whose selected variant carries no payload (#8).
+- Schema cache no longer poisoned by non-JSON responses; the body is parsed before being written to disk (#9).
+- Corrupt cached schema is now invalidated on the offline fallback so the next run fetches cleanly (#9).
 
 ## [1.0.5] - 2026-05-05
 

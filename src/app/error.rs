@@ -32,6 +32,27 @@ pub enum CliError {
     #[error("unexpected server response: {0}")]
     UnexpectedResponse(String),
 
+    #[error(
+        "could not parse {path} response as JSON ({reason})\n  status: {status}\n  content-type: {content_type}\n  body length: {byte_len} bytes\n  body snippet: {snippet}"
+    )]
+    SchemaParse {
+        path: String,
+        reason: String,
+        status: u16,
+        content_type: String,
+        byte_len: usize,
+        snippet: String,
+    },
+    #[error(
+        "cached schema is corrupt and was discarded; rerun the command to refetch from the server\n  cache file: {file}\n  reason: {reason}\n  byte length: {byte_len} bytes\n  snippet: {snippet}"
+    )]
+    SchemaCacheCorrupt {
+        file: String,
+        reason: String,
+        byte_len: usize,
+        snippet: String,
+    },
+
     #[error("unknown object: {0}")]
     UnknownObject(String),
     #[error("{0} is a view; use the underlying object name")]

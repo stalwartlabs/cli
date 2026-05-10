@@ -52,6 +52,10 @@ pub struct GlobalArgs {
     /// Disable ANSI color output
     #[arg(long, global = true)]
     pub no_color: bool,
+
+    /// Print HTTP request/response diagnostics to stderr
+    #[arg(long, global = true)]
+    pub debug: bool,
 }
 
 #[derive(Subcommand, Debug)]
