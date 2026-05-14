@@ -5,9 +5,7 @@
  */
 
 use crate::render::Ansi;
-use crate::schema::{
-    FieldType, MapValueType, NumberFormat, ObjectSchema, ScalarType, Schema, StringFormat,
-};
+use crate::schema::{FieldType, MapValueType, NumberFormat, ObjectSchema, ScalarType, Schema};
 use crate::util::display_cache::DisplayCache;
 use serde_json::Value;
 
@@ -24,12 +22,9 @@ pub fn render_inline(
         return;
     }
     match field_type {
-        FieldType::String { format, .. } => match format {
-            StringFormat::Secret | StringFormat::SecretText => out.push_str("*****"),
-            _ => match value.as_str() {
-                Some(s) => out.push_str(s),
-                None => push_raw_json(out, value),
-            },
+        FieldType::String { .. } => match value.as_str() {
+            Some(s) => out.push_str(s),
+            None => push_raw_json(out, value),
         },
         FieldType::Number { format, .. } => render_number(out, value, format),
         FieldType::UtcDateTime { .. } => match value.as_str() {
@@ -371,9 +366,57 @@ fn render_map_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::StringFormat;
+    use serde_json::json;
 
     fn s() -> String {
         String::new()
+    }
+
+    fn string_type(format: StringFormat) -> FieldType {
+        FieldType::String {
+            format,
+            min_length: None,
+            max_length: None,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn secret_value_rendered_verbatim_from_server() {
+        let schema = Schema::default();
+        let cache = DisplayCache::new();
+        let ansi = Ansi::new(false);
+        let typ = string_type(StringFormat::Secret);
+
+        let mut out = s();
+        render_inline(
+            &mut out,
+            &schema,
+            &json!("API_AAAADAAAAAJwz-sJIxu1a-wgtRpEAGDyzlJH7Q"),
+            &typ,
+            &cache,
+            ansi,
+        );
+        assert_eq!(out, "API_AAAADAAAAAJwz-sJIxu1a-wgtRpEAGDyzlJH7Q");
+
+        let mut out = s();
+        render_inline(&mut out, &schema, &json!("****"), &typ, &cache, ansi);
+        assert_eq!(out, "****");
+
+        let mut out = s();
+        render_inline(
+            &mut out,
+            &schema,
+            &json!("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"),
+            &string_type(StringFormat::SecretText),
+            &cache,
+            ansi,
+        );
+        assert_eq!(
+            out,
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"
+        );
     }
 
     #[test]

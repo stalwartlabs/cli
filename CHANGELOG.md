@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. This projec
 - `apply`: missing update `id` error now points at the top-level field, not the `value` keys.
 
 ### Fixed
+- Secret-typed fields are now printed verbatim from the server.
 
 ## [1.0.6] - 2026-05-11
 
