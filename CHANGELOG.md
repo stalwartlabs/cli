@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.7] - 2026-05-XX
+
+### Added
+
+### Changed
+- `apply`: missing update `id` error now points at the top-level field, not the `value` keys.
+
+### Fixed
+
 ## [1.0.6] - 2026-05-11
 
 ### Added

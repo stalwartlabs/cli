@@ -229,7 +229,7 @@ impl Plan {
                         schema.objects.get(canonical),
                         Some(ObjectType::Singleton { .. })
                     );
-                    let id = resolve_update_id(canonical, is_singleton, id.as_deref())?;
+                    let id = resolve_update_id(canonical, is_singleton, id.as_deref(), index)?;
                     updates += 1;
                     ops.push(ResolvedOp::Update {
                         canonical: canonical.to_string(),
@@ -303,7 +303,12 @@ impl Plan {
     }
 }
 
-fn resolve_update_id(canonical: &str, is_singleton: bool, id: Option<&str>) -> CliResult<String> {
+fn resolve_update_id(
+    canonical: &str,
+    is_singleton: bool,
+    id: Option<&str>,
+    index: usize,
+) -> CliResult<String> {
     if is_singleton {
         match id {
             None | Some("singleton") => Ok("singleton".to_string()),
@@ -312,9 +317,13 @@ fn resolve_update_id(canonical: &str, is_singleton: bool, id: Option<&str>) -> C
     } else {
         match id {
             Some(v) if !v.is_empty() => Ok(v.to_string()),
-            _ => Err(CliError::IdRequired(
-                resolve::display_name(canonical).to_string(),
-            )),
+            _ => Err(CliError::msg(format!(
+                "update operation #{} on `{}` is missing the top-level `id` field \
+                 (required for non-singletons; `id` is a sibling of `value`, \
+                 not a key inside it)",
+                index + 1,
+                resolve::display_name(canonical),
+            ))),
         }
     }
 }
@@ -888,9 +897,27 @@ mod tests {
     }
 
     #[test]
+    fn missing_update_id_names_top_level_field() {
+        let err = resolve_update_id("x:Domain", false, None, 4).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("operation #5"), "expected op #5, got: {msg}");
+        assert!(msg.contains("top-level `id`"), "missing field hint: {msg}");
+        assert!(
+            msg.contains("sibling of `value`"),
+            "missing shape hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_update_id_is_ok_for_singleton() {
+        let id = resolve_update_id("x:SystemSettings", true, None, 0).unwrap();
+        assert_eq!(id, "singleton");
+        let id = resolve_update_id("x:SystemSettings", true, Some("singleton"), 0).unwrap();
+        assert_eq!(id, "singleton");
+    }
+
+    #[test]
     fn rejects_json_array_form() {
-        // The pre-NDJSON format was `[{...},{...}]` on a single line; that
-        // should now fail because the bracketed form is not a valid op record.
         let input = "[{\"@type\":\"destroy\",\"object\":\"Domain\"}]\n";
         let err = parse_ndjson_plan(input).unwrap_err();
         let msg = format!("{err}");
