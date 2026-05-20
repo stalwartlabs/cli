@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.0.7] - 2026-05-19
+## [1.0.7] - 2026-05-20
 
 ### Added
 
@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - Secret-typed fields are now printed verbatim from the server.
+- `snapshot` no longer corrupts terminal output by interleaving progress messages mid-record.
 
 ## [1.0.6] - 2026-05-11
 

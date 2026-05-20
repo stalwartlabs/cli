@@ -82,7 +82,7 @@ fn open_output(path: Option<&Path>) -> CliResult<Box<dyn Write>> {
             let f = File::create(p)?;
             Ok(Box::new(BufWriter::new(f)))
         }
-        None => Ok(Box::new(BufWriter::new(std::io::stdout().lock()))),
+        None => Ok(Box::new(std::io::stdout().lock())),
     }
 }
 
@@ -884,10 +884,12 @@ fn emit_create<W: Write>(
         CliError::UnexpectedResponse(format!("no schema available for {}", shard.key.canonical))
     })?;
 
+    sink.flush()?;
     cache.ensure(cx, &shard.key.canonical, reporter)?;
 
     let objs = cache.objects_for(&shard.key);
     if objs.is_empty() {
+        sink.flush()?;
         reporter.shard_done(&shard.key, 0);
         return Ok(());
     }
@@ -927,6 +929,7 @@ fn emit_create<W: Write>(
     }
 
     sink.write_all(b"}}\n")?;
+    sink.flush()?;
     reporter.shard_done(&shard.key, total);
     Ok(())
 }
@@ -1122,6 +1125,7 @@ fn emit_singleton_update<W: Write>(
             CliError::UnexpectedResponse(format!("singleton schema missing for {canonical}"))
         })?;
 
+    sink.flush()?;
     reporter.singleton_start(canonical);
 
     let method = format!("{canonical}/get");
@@ -1865,6 +1869,151 @@ mod tests {
         assert!(
             key.starts_with("#role-"),
             "expected role id to be `#role-...`, got `{key}`"
+        );
+    }
+
+    #[derive(Default)]
+    struct TrackingSink {
+        events: Vec<SinkEvent>,
+        bytes: Vec<u8>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SinkEvent {
+        Wrote(usize),
+        Flushed,
+    }
+
+    impl Write for TrackingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.events.push(SinkEvent::Wrote(buf.len()));
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.events.push(SinkEvent::Flushed);
+            Ok(())
+        }
+    }
+
+    fn snapshot_ctx<'a>(
+        schema: &'a Schema,
+        allow: &'a HashSet<String>,
+        jmap: &'a Jmap<'a>,
+    ) -> Ctx<'a> {
+        Ctx {
+            jmap,
+            schema,
+            allow,
+            include_secrets: false,
+            limit: 100,
+        }
+    }
+
+    fn dummy_jmap_http() -> crate::jmap::http::HttpClient {
+        let cfg = crate::app::config::Config {
+            url: "http://localhost".into(),
+            auth: crate::app::config::AuthMode::Bearer {
+                token: "x".into(),
+            },
+            insecure: false,
+            color: false,
+            debug: false,
+        };
+        crate::jmap::http::HttpClient::new(&cfg).unwrap()
+    }
+
+    #[test]
+    fn emit_create_flushes_sink_around_reporter_calls() {
+        let s = tenant_role_schema(true, true);
+        let shard = Shard {
+            key: ShardKey {
+                canonical: "x:Role".into(),
+                variant: None,
+            },
+            is_singleton: false,
+        };
+
+        let mut role_groups: VariantGroups = HashMap::new();
+        let mut role = Map::new();
+        role.insert("id".into(), Value::String("r1".into()));
+        role_groups.entry(None).or_default().push(role);
+        let mut cache = FetchCache::new();
+        cache.by_canonical.insert("x:Role".into(), role_groups);
+
+        let allow: HashSet<String> = HashSet::new();
+        let http = dummy_jmap_http();
+        let jmap = Jmap::new(&http, "/");
+        let cx = snapshot_ctx(&s, &allow, &jmap);
+
+        let mut sink = TrackingSink::default();
+        let mut reporter = Reporter::new(true);
+        emit_create(&mut sink, &cx, &shard, &[], &mut cache, &mut reporter).unwrap();
+
+        assert_eq!(
+            sink.events.first(),
+            Some(&SinkEvent::Flushed),
+            "expected emit_create to flush before any potential progress writes, got: {:?}",
+            sink.events
+        );
+        assert_eq!(
+            sink.events.last(),
+            Some(&SinkEvent::Flushed),
+            "expected emit_create to flush before the trailing shard_done report, got: {:?}",
+            sink.events
+        );
+
+        let last_flush = sink
+            .events
+            .iter()
+            .rposition(|e| matches!(e, SinkEvent::Flushed))
+            .unwrap();
+        let last_write = sink
+            .events
+            .iter()
+            .rposition(|e| matches!(e, SinkEvent::Wrote(_)))
+            .unwrap();
+        assert!(
+            last_write < last_flush,
+            "no flush between final write and end of emit_create: {:?}",
+            sink.events
+        );
+    }
+
+    #[test]
+    fn emit_create_flushes_sink_on_empty_shard() {
+        let s = tenant_role_schema(true, true);
+        let shard = Shard {
+            key: ShardKey {
+                canonical: "x:Role".into(),
+                variant: None,
+            },
+            is_singleton: false,
+        };
+
+        let mut cache = FetchCache::new();
+        cache
+            .by_canonical
+            .insert("x:Role".into(), VariantGroups::new());
+
+        let allow: HashSet<String> = HashSet::new();
+        let http = dummy_jmap_http();
+        let jmap = Jmap::new(&http, "/");
+        let cx = snapshot_ctx(&s, &allow, &jmap);
+
+        let mut sink = TrackingSink::default();
+        let mut reporter = Reporter::new(true);
+        emit_create(&mut sink, &cx, &shard, &[], &mut cache, &mut reporter).unwrap();
+
+        assert!(
+            sink.events.iter().all(|e| matches!(e, SinkEvent::Flushed)),
+            "empty shard must not emit any bytes, got: {:?}",
+            sink.events
+        );
+        assert_eq!(
+            sink.events.last(),
+            Some(&SinkEvent::Flushed),
+            "expected a flush before the empty-shard shard_done report"
         );
     }
 
