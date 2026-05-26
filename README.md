@@ -59,7 +59,7 @@ brew install stalwartlabs/tap/stalwart-cli
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/stalwartlabs/cli/releases/latest/download/stalwart-cli-installer.ps1 | iex"
 
 # npm
-npm install -g @stalwartlabs/cli
+npm install -g stalwart-cli
 
 # From source
 cargo install --path .

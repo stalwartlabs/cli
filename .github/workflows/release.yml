@@ -265,12 +265,43 @@ jobs:
           done
           git push
 
+  publish-npm:
+    needs:
+      - plan
+      - host
+    runs-on: "ubuntu-22.04"
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    permissions:
+      "contents": "read"
+      "id-token": "write"
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Fetch npm tarball
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: artifacts/
+          merge-multiple: true
+      - name: Publish to npm
+        env:
+          IS_PRERELEASE: ${{ fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+        run: |
+          TAG_FLAG=""
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            TAG_FLAG="--tag next"
+          fi
+          npm publish artifacts/stalwart-cli-npm-package.tar.gz --provenance --access public $TAG_FLAG
+
   announce:
     needs:
       - plan
       - host
       - publish-homebrew-formula
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
+      - publish-npm
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') && (needs.publish-npm.result == 'skipped' || needs.publish-npm.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -290,6 +321,7 @@ jobs:
       - build-global-artifacts
       - host
       - publish-homebrew-formula
+      - publish-npm
       - announce
     if: ${{ failure() && needs.plan.outputs.publishing == 'true' }}
     runs-on: "ubuntu-22.04"

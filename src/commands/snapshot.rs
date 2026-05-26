@@ -605,6 +605,11 @@ fn display_shard(key: &ShardKey) -> String {
     }
 }
 
+fn empty_fields() -> &'static Fields {
+    static EMPTY: std::sync::OnceLock<Fields> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(Fields::default)
+}
+
 fn shard_fields<'a>(schema: &'a Schema, key: &ShardKey) -> Option<&'a Fields> {
     let obj_schema = schema.schemas.get(&key.canonical)?;
     match obj_schema {
@@ -614,7 +619,10 @@ fn shard_fields<'a>(schema: &'a Schema, key: &ShardKey) -> Option<&'a Fields> {
                 .variant
                 .as_ref()
                 .and_then(|name| variants.iter().find(|v| &v.name == name))?;
-            schema.fields.get(v.schema_name.as_ref()?)
+            match &v.schema_name {
+                Some(sn) => schema.fields.get(sn),
+                None => Some(empty_fields()),
+            }
         }
     }
 }
@@ -1104,6 +1112,41 @@ fn partition_into(list: &[Value], groups: &mut VariantGroups) {
     }
 }
 
+fn singleton_fields_for<'a>(
+    schema: &'a Schema,
+    canonical: &str,
+    obj: &Map<String, Value>,
+) -> CliResult<&'a Fields> {
+    let obj_schema = schema.schemas.get(canonical).ok_or_else(|| {
+        CliError::UnexpectedResponse(format!("singleton schema missing for {canonical}"))
+    })?;
+    match obj_schema {
+        ObjectSchema::Single { schema_name } => Ok(schema
+            .fields
+            .get(schema_name)
+            .unwrap_or_else(|| empty_fields())),
+        ObjectSchema::Multiple { variants } => {
+            let at_type = obj.get("@type").and_then(Value::as_str).ok_or_else(|| {
+                CliError::UnexpectedResponse(format!(
+                    "multi-variant singleton {} returned no @type",
+                    resolve::display_name(canonical)
+                ))
+            })?;
+            let variant = variants.iter().find(|v| v.name == at_type).ok_or_else(|| {
+                CliError::UnexpectedResponse(format!(
+                    "unknown variant {at_type} for singleton {}",
+                    resolve::display_name(canonical)
+                ))
+            })?;
+            Ok(variant
+                .schema_name
+                .as_ref()
+                .and_then(|sn| schema.fields.get(sn))
+                .unwrap_or_else(|| empty_fields()))
+        }
+    }
+}
+
 fn emit_singleton_update<W: Write>(
     sink: &mut W,
     cx: &Ctx<'_>,
@@ -1114,16 +1157,11 @@ fn emit_singleton_update<W: Write>(
     let schema = cx.schema;
     let allow = cx.allow;
     let include_secrets = cx.include_secrets;
-    let fields = schema
-        .schemas
-        .get(canonical)
-        .and_then(|s| match s {
-            ObjectSchema::Single { schema_name } => schema.fields.get(schema_name),
-            ObjectSchema::Multiple { .. } => None,
-        })
-        .ok_or_else(|| {
-            CliError::UnexpectedResponse(format!("singleton schema missing for {canonical}"))
-        })?;
+    if !schema.schemas.contains_key(canonical) {
+        return Err(CliError::UnexpectedResponse(format!(
+            "singleton schema missing for {canonical}"
+        )));
+    }
 
     sink.flush()?;
     reporter.singleton_start(canonical);
@@ -1146,6 +1184,7 @@ fn emit_singleton_update<W: Write>(
     let obj = item
         .as_object()
         .ok_or_else(|| CliError::UnexpectedResponse("singleton result is not an object".into()))?;
+    let fields = singleton_fields_for(schema, canonical, obj)?;
     let transformed = transform_object(schema, fields, obj, allow, include_secrets);
 
     sink.write_all(b"{\"@type\":\"update\",\"object\":\"")?;
@@ -2073,6 +2112,184 @@ mod tests {
         assert_eq!(
             out,
             json!({"@type": "Automatic", "selectorTemplate": "v{version}"})
+        );
+    }
+
+    #[test]
+    fn snapshot_emits_marker_only_variant_as_type_only_record() {
+        use crate::schema::ObjectVariant;
+        let mut s = Schema::default();
+        s.objects.insert("x:DnsServer".into(), obj_type());
+        s.schemas.insert(
+            "x:DnsServer".into(),
+            ObjectSchema::Multiple {
+                variants: vec![
+                    ObjectVariant {
+                        name: "Cloudflare".into(),
+                        label: "".into(),
+                        schema_name: Some("x:DnsServerCloudflare".into()),
+                    },
+                    ObjectVariant {
+                        name: "Deprecated1".into(),
+                        label: "".into(),
+                        schema_name: None,
+                    },
+                ],
+            },
+        );
+        s.fields
+            .insert("x:DnsServerCloudflare".into(), fields_with(vec![]));
+
+        let plan = build_plan(&s, &["x:DnsServer".to_string()]).expect("plan must build");
+        let shards: Vec<&Shard> = plan.iter_non_singletons().collect();
+        assert_eq!(
+            shards.len(),
+            2,
+            "build_plan emits one shard per variant including marker-only; got: {:?}",
+            shards.iter().map(|sh| &sh.key).collect::<Vec<_>>(),
+        );
+        let marker_shard = shards
+            .iter()
+            .find(|sh| sh.key.variant.as_deref() == Some("Deprecated1"))
+            .copied()
+            .expect("marker-only variant must produce a shard");
+
+        let mut groups: VariantGroups = HashMap::new();
+        let mut obj = Map::new();
+        obj.insert("id".into(), Value::String("d1".into()));
+        obj.insert("@type".into(), Value::String("Deprecated1".into()));
+        groups
+            .entry(Some("Deprecated1".to_string()))
+            .or_default()
+            .push(obj);
+        let mut cache = FetchCache::new();
+        cache.by_canonical.insert("x:DnsServer".into(), groups);
+
+        let allow: HashSet<String> = HashSet::new();
+        let http = dummy_jmap_http();
+        let jmap = Jmap::new(&http, "/");
+        let cx = snapshot_ctx(&s, &allow, &jmap);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut reporter = Reporter::new(true);
+        emit_create(&mut buf, &cx, marker_shard, &[], &mut cache, &mut reporter)
+            .expect("emit_create must succeed for marker-only variant shard");
+
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "expected one create line, got: {output}");
+        let v: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v.get("@type"), Some(&Value::String("create".into())));
+        assert_eq!(v.get("object"), Some(&Value::String("DnsServer".into())));
+        let value = v.get("value").and_then(Value::as_object).unwrap();
+        assert_eq!(value.len(), 1, "expected one client-id entry, got: {value:?}");
+        let payload = value.values().next().and_then(Value::as_object).unwrap();
+        assert_eq!(
+            payload.get("@type"),
+            Some(&Value::String("Deprecated1".into())),
+            "marker-only payload must carry @type discriminator"
+        );
+        assert_eq!(
+            payload.len(),
+            1,
+            "marker-only payload must contain only @type; got: {payload:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_resolves_multi_variant_singleton_fields_by_at_type() {
+        use crate::schema::ObjectVariant;
+        let mut s = Schema::default();
+        s.objects.insert(
+            "x:BlobStore".into(),
+            ObjectType::Singleton {
+                description: "".into(),
+                permission_prefix: "".into(),
+                enterprise: false,
+            },
+        );
+        s.schemas.insert(
+            "x:BlobStore".into(),
+            ObjectSchema::Multiple {
+                variants: vec![
+                    ObjectVariant {
+                        name: "FileSystem".into(),
+                        label: "".into(),
+                        schema_name: Some("x:FileSystemBlobStore".into()),
+                    },
+                    ObjectVariant {
+                        name: "S3".into(),
+                        label: "".into(),
+                        schema_name: Some("x:S3BlobStore".into()),
+                    },
+                    ObjectVariant {
+                        name: "Default".into(),
+                        label: "".into(),
+                        schema_name: None,
+                    },
+                ],
+            },
+        );
+        s.fields.insert(
+            "x:FileSystemBlobStore".into(),
+            fields_with(vec![("path", objid_field("x:Tenant", true))]),
+        );
+        s.fields.insert(
+            "x:S3BlobStore".into(),
+            fields_with(vec![("bucket", objid_field("x:Tenant", true))]),
+        );
+
+        let plan = build_plan(&s, &["x:BlobStore".to_string()]).expect("plan must build");
+        assert_eq!(
+            plan.singletons(),
+            ["x:BlobStore".to_string()].as_slice(),
+            "multi-variant singletons still route through plan.singletons"
+        );
+
+        let fs_obj: Map<String, Value> = json!({"@type": "FileSystem", "path": "t1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let fs_fields = singleton_fields_for(&s, "x:BlobStore", &fs_obj)
+            .expect("FileSystem variant must resolve");
+        assert!(
+            fs_fields.properties.contains_key("path"),
+            "FileSystem fields must contain `path`; got: {:?}",
+            fs_fields.properties.keys().collect::<Vec<_>>()
+        );
+
+        let s3_obj: Map<String, Value> = json!({"@type": "S3", "bucket": "t1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let s3_fields = singleton_fields_for(&s, "x:BlobStore", &s3_obj)
+            .expect("S3 variant must resolve");
+        assert!(
+            s3_fields.properties.contains_key("bucket"),
+            "S3 fields must contain `bucket`; got: {:?}",
+            s3_fields.properties.keys().collect::<Vec<_>>()
+        );
+
+        let default_obj: Map<String, Value> = json!({"@type": "Default"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let default_fields = singleton_fields_for(&s, "x:BlobStore", &default_obj)
+            .expect("marker-only Default variant must resolve to empty fields");
+        assert!(
+            default_fields.properties.is_empty(),
+            "marker-only variant must yield empty properties; got: {:?}",
+            default_fields.properties.keys().collect::<Vec<_>>()
+        );
+
+        let unknown_obj: Map<String, Value> = json!({"@type": "Nonsense"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let err = singleton_fields_for(&s, "x:BlobStore", &unknown_obj)
+            .expect_err("unknown variant must be rejected");
+        assert!(
+            format!("{err}").contains("unknown variant Nonsense"),
+            "expected unknown-variant error, got: {err}"
         );
     }
 }

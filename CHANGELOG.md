@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.8] - 2026-05-XX
+
+### Added
+
+### Changed
+
+### Fixed
+- `snapshot` now handles multi-variant top-level Objects whose variants include marker-only ones and multi-variant Singletons.
+
+
 ## [1.0.7] - 2026-05-20
 
 ### Added
