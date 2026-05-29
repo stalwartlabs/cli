@@ -5,6 +5,7 @@ target
 **/mutants.out*/
 *.md
 .*
+!.github
 !.gitignore
 !CHANGELOG.md
 !README.md
