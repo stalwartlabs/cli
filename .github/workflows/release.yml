@@ -278,13 +278,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
       - name: Fetch npm tarball
         uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
           path: artifacts/
           merge-multiple: true
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
       - name: Publish to npm
         env:
           IS_PRERELEASE: ${{ fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
