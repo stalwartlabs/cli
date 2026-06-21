@@ -1,0 +1,121 @@
+name: Docker image (backfill)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build the image from (e.g. v1.0.8)"
+        required: true
+        default: "v1.0.8"
+      latest:
+        description: "Also push the :latest tag"
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  docker:
+    name: Build and push container image for ${{ inputs.tag }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      "attestations": "write"
+      "contents": "read"
+      "id-token": "write"
+      "packages": "write"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+      DOCKERHUB_IMAGE: index.docker.io/${{ github.repository }}
+    steps:
+      - name: Download published musl binaries
+        run: |
+          set -eux
+          mkdir -p dl
+          gh release download "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern '*-unknown-linux-musl.tar.xz' \
+            --dir dl
+      - name: Stage musl binaries per architecture
+        run: |
+          set -eux
+          mkdir -p bin/amd64 bin/arm64
+          tar -xJf dl/stalwart-cli-x86_64-unknown-linux-musl.tar.xz \
+            -C bin/amd64 --strip-components=1 \
+            stalwart-cli-x86_64-unknown-linux-musl/stalwart-cli
+          tar -xJf dl/stalwart-cli-aarch64-unknown-linux-musl.tar.xz \
+            -C bin/arm64 --strip-components=1 \
+            stalwart-cli-aarch64-unknown-linux-musl/stalwart-cli
+          chmod +x bin/amd64/stalwart-cli bin/arm64/stalwart-cli
+      - name: Write Dockerfile
+        run: |
+          cat > Dockerfile <<'EOF'
+          FROM gcr.io/distroless/static-debian12:nonroot
+          ARG TARGETARCH
+          COPY bin/${TARGETARCH}/stalwart-cli /usr/local/bin/stalwart-cli
+          ENTRYPOINT ["/usr/local/bin/stalwart-cli"]
+          EOF
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -eux
+          version="${{ inputs.tag }}"
+          version="${version#v}"
+          minor="${version%.*}"
+          {
+            echo "tags<<EOF"
+            for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE"; do
+              echo "${image}:${version}"
+              echo "${image}:${minor}"
+              if [ "${{ inputs.latest }}" = "true" ]; then
+                echo "${image}:latest"
+              fi
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.tags.outputs.tags }}
+      - name: Sign images
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -eux
+          for repo in $(for tag in $TAGS; do echo "${tag%:*}"; done | sort -u); do
+            cosign sign --yes "${repo}@${DIGEST}"
+          done
+      - name: Attest GHCR provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Attest Docker Hub provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.DOCKERHUB_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

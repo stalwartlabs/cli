@@ -67,6 +67,32 @@ cargo install --path .
 
 A signed `.msi` is also published with each release.
 
+### Docker
+
+A multi-arch image (`linux/amd64`, `linux/arm64`) is published with every release to both registries:
+
+```sh
+docker run --rm ghcr.io/stalwartlabs/cli --help
+docker run --rm stalwartlabs/cli --help
+
+docker run --rm \
+  -e STALWART_URL=https://mail.example.com \
+  -e STALWART_TOKEN \
+  ghcr.io/stalwartlabs/cli query Account --fields id,name
+```
+
+Tags track releases (`:1.2.3`, `:1.2`, `:latest`). Images are signed with cosign and carry build-provenance attestations.
+
+`apply --file` and `snapshot --output` need a mounted working directory, and a persistent schema cache avoids a re-fetch on every run:
+
+```sh
+docker run --rm \
+  -v "$PWD:/work" -w /work \
+  -v stalwart-cli-cache:/home/nonroot/.cache \
+  -e STALWART_URL -e STALWART_TOKEN \
+  ghcr.io/stalwartlabs/cli apply --file plan.json
+```
+
 ## Quick start
 
 ```sh
@@ -94,10 +120,10 @@ Full documentation, including the bulk-apply file format, JSON Schema, and integ
 
 ## License
 
-This project is dual-licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0; as published by the Free Software Foundation) and the **Stalwart Enterprise License v1 (SELv1)**:
+This project is dual-licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0; as published by the Free Software Foundation) OR the **Stalwart Enterprise License v2 (SELv2)**:
 
 - The [GNU Affero General Public License v3.0](./LICENSES/AGPL-3.0-only.txt) is a free software license that ensures your freedom to use, modify, and distribute the software, with the condition that any modified versions of the software must also be distributed under the same license. 
-- The [Stalwart Enterprise License v1 (SELv1)](./LICENSES/LicenseRef-SEL.txt) is a proprietary license designed for commercial use. It offers additional features and greater flexibility for businesses that do not wish to comply with the AGPL-3.0 license requirements. 
+- The [Stalwart Enterprise License v2 (SELv2)](./LICENSES/LicenseRef-SEL.txt) is a proprietary license designed for commercial use. It offers additional features and greater flexibility for businesses that do not wish to comply with the AGPL-3.0 license requirements. 
 
 Each file in this project contains a license notice at the top, indicating the applicable license(s). The license notice follows the [REUSE guidelines](https://reuse.software/) to ensure clarity and consistency. The full text of each license is available in the [LICENSES](./LICENSES/) directory.
 
