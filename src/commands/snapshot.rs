@@ -41,15 +41,6 @@ pub fn run(ctx: &Context, args: &SnapshotArgs) -> CliResult<()> {
 
     let mut sink = open_output(args.output.as_deref())?;
 
-    if !args.no_destroys {
-        let mut emitted: HashSet<String> = HashSet::new();
-        for shard in plan.iter_non_singletons() {
-            if emitted.insert(shard.key.canonical.clone()) {
-                emit_destroy(&mut sink, &shard.key.canonical)?;
-            }
-        }
-    }
-
     let jmap = Jmap::new(&ctx.client, &ctx.session.api_path);
     let snap_ctx = Ctx {
         jmap: &jmap,
@@ -62,7 +53,7 @@ pub fn run(ctx: &Context, args: &SnapshotArgs) -> CliResult<()> {
     let mut cache = FetchCache::new();
     for shard in plan.iter_non_singletons() {
         let deferred = plan.deferred_for(&shard.key);
-        emit_create(&mut sink, &snap_ctx, shard, &deferred, &mut cache, &mut reporter)?;
+        emit_upsert(&mut sink, &snap_ctx, shard, &deferred, &mut cache, &mut reporter)?;
     }
 
     emit_deferred_updates(&mut sink, &snap_ctx, &plan, &mut cache)?;
@@ -870,14 +861,15 @@ fn canonical_refs(schema: &Schema, canonical: &str) -> Vec<String> {
     canonicals
 }
 
-fn emit_destroy<W: Write>(sink: &mut W, canonical: &str) -> CliResult<()> {
-    sink.write_all(b"{\"@type\":\"destroy\",\"object\":\"")?;
-    sink.write_all(resolve::display_name(canonical).as_bytes())?;
-    sink.write_all(b"\"}\n")?;
-    Ok(())
+fn match_on_for(schema: &Schema, canonical: &str) -> Option<Vec<String>> {
+    schema
+        .lists
+        .get(canonical)
+        .and_then(|l| l.label_property.clone())
+        .map(|p| vec![p])
 }
 
-fn emit_create<W: Write>(
+fn emit_upsert<W: Write>(
     sink: &mut W,
     cx: &Ctx<'_>,
     shard: &Shard,
@@ -904,9 +896,19 @@ fn emit_create<W: Write>(
 
     let omit: HashSet<&str> = deferred.iter().map(|d| d.field.as_str()).collect();
 
-    sink.write_all(b"{\"@type\":\"create\",\"object\":\"")?;
+    let match_on = match_on_for(schema, &shard.key.canonical);
+    if match_on.is_none() {
+        reporter.value_match_warning(&shard.key.canonical);
+    }
+
+    sink.write_all(b"{\"@type\":\"upsert\",\"object\":\"")?;
     sink.write_all(resolve::display_name(&shard.key.canonical).as_bytes())?;
-    sink.write_all(b"\",\"value\":{")?;
+    sink.write_all(b"\"")?;
+    if let Some(keys) = &match_on {
+        sink.write_all(b",\"matchOn\":")?;
+        serde_json::to_writer(&mut *sink, &json!(keys))?;
+    }
+    sink.write_all(b",\"value\":{")?;
 
     let mut first_entry = true;
     let mut total = 0usize;
@@ -1441,23 +1443,40 @@ fn transform_object_list(
 
 struct Reporter {
     quiet: bool,
+    warned: HashSet<String>,
 }
 
 impl Reporter {
     fn new(quiet: bool) -> Self {
-        Reporter { quiet }
+        Reporter {
+            quiet,
+            warned: HashSet::new(),
+        }
     }
     fn plan_header(&self, plan: &Plan) {
         if self.quiet {
             return;
         }
         let mut err = std::io::stderr().lock();
-        let destroys = plan.shards.iter().filter(|s| !s.is_singleton).count();
+        let upserts = plan.shards.iter().filter(|s| !s.is_singleton).count();
         let _ = writeln!(
             err,
-            "snapshot: {} creates, {} singletons",
-            destroys,
+            "snapshot: {} upserts, {} singletons",
+            upserts,
             plan.singletons.len()
+        );
+    }
+    fn value_match_warning(&mut self, canonical: &str) {
+        if self.quiet || !self.warned.insert(canonical.to_string()) {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(
+            err,
+            "  warning: {} has no label property; objects will be matched by value on apply \
+             (a changed object will be created as a new one). Add a `matchOn` to the plan to \
+             match on a specific key.",
+            resolve::display_name(canonical)
         );
     }
     fn fetch_start(&mut self, canonical: &str) {
@@ -1856,7 +1875,7 @@ mod tests {
             let mut reporter = Reporter::new(true);
             for shard in plan.iter_non_singletons() {
                 let deferred = plan.deferred_for(&shard.key);
-                emit_create(
+                emit_upsert(
                     &mut sink,
                     &cx,
                     shard,
@@ -1873,7 +1892,7 @@ mod tests {
         assert_eq!(lines.len(), 3, "expected 3 ndjson lines, got: {output}");
 
         let create_tenant: Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(create_tenant.get("@type"), Some(&Value::String("create".into())));
+        assert_eq!(create_tenant.get("@type"), Some(&Value::String("upsert".into())));
         assert_eq!(create_tenant.get("object"), Some(&Value::String("Tenant".into())));
         let value = create_tenant
             .get("value")
@@ -1886,7 +1905,7 @@ mod tests {
         );
 
         let create_role: Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(create_role.get("@type"), Some(&Value::String("create".into())));
+        assert_eq!(create_role.get("@type"), Some(&Value::String("upsert".into())));
         assert_eq!(create_role.get("object"), Some(&Value::String("Role".into())));
 
         let update_tenant: Value = serde_json::from_str(lines[2]).unwrap();
@@ -1963,6 +1982,61 @@ mod tests {
     }
 
     #[test]
+    fn emit_upsert_writes_match_on_from_label_property() {
+        use crate::schema::List;
+        let mut s = tenant_role_schema(true, true);
+        s.lists.insert(
+            "x:Role".into(),
+            List {
+                title: String::new(),
+                subtitle: String::new(),
+                label_property: Some("name".into()),
+                singular_name: String::new(),
+                plural_name: String::new(),
+                columns: vec![],
+                filters: vec![],
+                filters_static: HashMap::new(),
+                sort: vec![],
+                mass_actions: vec![],
+                item_actions: vec![],
+            },
+        );
+        let shard = Shard {
+            key: ShardKey {
+                canonical: "x:Role".into(),
+                variant: None,
+            },
+            is_singleton: false,
+        };
+        let mut role_groups: VariantGroups = HashMap::new();
+        let mut role = Map::new();
+        role.insert("id".into(), Value::String("r1".into()));
+        role.insert("name".into(), Value::String("admin".into()));
+        role_groups.entry(None).or_default().push(role);
+        let mut cache = FetchCache::new();
+        cache.by_canonical.insert("x:Role".into(), role_groups);
+
+        let allow: HashSet<String> = HashSet::new();
+        let http = dummy_jmap_http();
+        let jmap = Jmap::new(&http, "/");
+        let cx = snapshot_ctx(&s, &allow, &jmap);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut reporter = Reporter::new(true);
+        emit_upsert(&mut buf, &cx, &shard, &[], &mut cache, &mut reporter).unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| !l.is_empty()).unwrap();
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v.get("@type"), Some(&Value::String("upsert".into())));
+        assert_eq!(
+            v.get("matchOn"),
+            Some(&json!(["name"])),
+            "expected matchOn derived from label property, got: {line}"
+        );
+    }
+
+    #[test]
     fn emit_create_flushes_sink_around_reporter_calls() {
         let s = tenant_role_schema(true, true);
         let shard = Shard {
@@ -1987,7 +2061,7 @@ mod tests {
 
         let mut sink = TrackingSink::default();
         let mut reporter = Reporter::new(true);
-        emit_create(&mut sink, &cx, &shard, &[], &mut cache, &mut reporter).unwrap();
+        emit_upsert(&mut sink, &cx, &shard, &[], &mut cache, &mut reporter).unwrap();
 
         assert_eq!(
             sink.events.first(),
@@ -2042,7 +2116,7 @@ mod tests {
 
         let mut sink = TrackingSink::default();
         let mut reporter = Reporter::new(true);
-        emit_create(&mut sink, &cx, &shard, &[], &mut cache, &mut reporter).unwrap();
+        emit_upsert(&mut sink, &cx, &shard, &[], &mut cache, &mut reporter).unwrap();
 
         assert!(
             sink.events.iter().all(|e| matches!(e, SinkEvent::Flushed)),
@@ -2171,14 +2245,14 @@ mod tests {
         let cx = snapshot_ctx(&s, &allow, &jmap);
         let mut buf: Vec<u8> = Vec::new();
         let mut reporter = Reporter::new(true);
-        emit_create(&mut buf, &cx, marker_shard, &[], &mut cache, &mut reporter)
+        emit_upsert(&mut buf, &cx, marker_shard, &[], &mut cache, &mut reporter)
             .expect("emit_create must succeed for marker-only variant shard");
 
         let output = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1, "expected one create line, got: {output}");
         let v: Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(v.get("@type"), Some(&Value::String("create".into())));
+        assert_eq!(v.get("@type"), Some(&Value::String("upsert".into())));
         assert_eq!(v.get("object"), Some(&Value::String("DnsServer".into())));
         let value = v.get("value").and_then(Value::as_object).unwrap();
         assert_eq!(value.len(), 1, "expected one client-id entry, got: {value:?}");

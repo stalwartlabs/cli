@@ -1,11 +1,12 @@
+mod common;
+
 use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-const URL: &str = "http://localhost:8080";
-const USER: &str = "admin";
-const PASS: &str = "admin";
+use common::stalwart;
+use common::stalwart::{ADMIN_PASSWORD as PASS, ADMIN_USER as USER};
 
 const SEED_DOMAIN: &str = "itest-cli.local";
 const SEED_ADMIN_NAME: &str = "admin";
@@ -14,9 +15,13 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_stalwart-cli")
 }
 
+fn server() -> &'static stalwart::Stalwart {
+    stalwart::shared().expect("stalwart test container should be available")
+}
+
 fn run_args(args: &[&str]) -> Output {
     Command::new(bin())
-        .args(["--url", URL, "--user", USER, "--password", PASS])
+        .args(["--url", server().base_url(), "--user", USER, "--password", PASS, "--insecure"])
         .args(args)
         .output()
         .expect("failed to spawn stalwart-cli")
@@ -24,7 +29,7 @@ fn run_args(args: &[&str]) -> Output {
 
 fn run_with_stdin(args: &[&str], stdin_data: &[u8]) -> Output {
     let mut child = Command::new(bin())
-        .args(["--url", URL, "--user", USER, "--password", PASS])
+        .args(["--url", server().base_url(), "--user", USER, "--password", PASS, "--insecure"])
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -40,15 +45,10 @@ fn run_with_stdin(args: &[&str], stdin_data: &[u8]) -> Output {
     child.wait_with_output().expect("wait")
 }
 
-fn server_reachable() -> bool {
-    static REACHABLE: OnceLock<bool> = OnceLock::new();
-    *REACHABLE.get_or_init(|| run_args(&["describe"]).status.success())
-}
-
 macro_rules! require_server {
     () => {
-        if !server_reachable() {
-            eprintln!("skipping: stalwart instance at {URL} not reachable");
+        if stalwart::shared().is_none() {
+            eprintln!("skipping: stalwart test container unavailable");
             return;
         }
     };
@@ -85,20 +85,7 @@ struct DomainCleanup(String);
 
 impl Drop for DomainCleanup {
     fn drop(&mut self) {
-        let _ = Command::new(bin())
-            .args([
-                "--url",
-                URL,
-                "--user",
-                USER,
-                "--password",
-                PASS,
-                "delete",
-                "Domain",
-                "--ids",
-                &self.0,
-            ])
-            .output();
+        let _ = run_args(&["delete", "Domain", "--ids", &self.0]);
     }
 }
 
@@ -313,32 +300,22 @@ fn snapshot_tracer_emits_ndjson_with_no_at_type_filter() {
         "snapshot output must be NDJSON, not a JSON array"
     );
 
-    let mut destroy_seen = false;
-    let mut create_seen = false;
+    let mut upsert_seen = false;
     for line in trimmed.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let v: Value = serde_json::from_str(line).expect("each line valid JSON");
         let kind = v["@type"].as_str().expect("@type field");
-        match kind {
-            "destroy" => {
-                destroy_seen = true;
-                if let Some(value) = v.get("value")
-                    && let Some(obj) = value.as_object()
-                {
-                    assert!(
-                        !obj.contains_key("@type"),
-                        "snapshot destroys must not carry an @type filter (regression of multi-variant fix): {line}"
-                    );
-                }
-            }
-            "create" => create_seen = true,
-            _ => {}
+        assert_ne!(
+            kind, "destroy",
+            "snapshot must not emit destroy ops anymore: {line}"
+        );
+        if kind == "upsert" {
+            upsert_seen = true;
         }
     }
-    assert!(destroy_seen, "expected at least one destroy op");
-    assert!(create_seen, "expected at least one create op");
+    assert!(upsert_seen, "expected at least one upsert op");
 }
 
 #[test]
@@ -409,6 +386,39 @@ fn create_update_get_delete_domain() {
 }
 
 #[test]
+fn create_duplicate_renders_set_error_and_exits_nonzero() {
+    require_server!();
+    let name = format!("dup-{}.example.com", unique_suffix());
+
+    let out = run_args(&["create", "Domain", "--field", &format!("name={name}")]);
+    assert_ok(&out, "create Domain");
+    let id = stdout_string(&out)
+        .split_whitespace()
+        .last()
+        .expect("created id")
+        .trim_end_matches(['\n', '\r'])
+        .to_string();
+
+    let dup = run_args(&["create", "Domain", "--field", &format!("name={name}")]);
+    assert!(
+        !dup.status.success(),
+        "creating a duplicate domain must fail with a non-zero exit"
+    );
+    let err = stderr_string(&dup);
+    assert!(
+        err.contains("primaryKeyViolation"),
+        "expected the real SetError type to render: {err}"
+    );
+    assert!(
+        err.contains("name"),
+        "expected the offending property to render: {err}"
+    );
+
+    delete_ids("DkimSignature", &ids_where("DkimSignature", &format!("domainId={id}")));
+    delete_id("Domain", &id);
+}
+
+#[test]
 fn update_unknown_id_errors_clearly() {
     require_server!();
     let out = run_args(&[
@@ -430,7 +440,16 @@ fn update_unknown_id_errors_clearly() {
 fn query_pipe_to_head_returns_zero_no_broken_pipe_error() {
     require_server!();
     let mut cli = Command::new(bin())
-        .args(["--url", URL, "--user", USER, "--password", PASS, "describe"])
+        .args([
+            "--url",
+            server().base_url(),
+            "--user",
+            USER,
+            "--password",
+            PASS,
+            "--insecure",
+            "describe",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -460,11 +479,12 @@ fn auth_failure_exits_nonzero_and_prints_error() {
     let out = Command::new(bin())
         .args([
             "--url",
-            URL,
+            server().base_url(),
             "--user",
             "admin",
             "--password",
             "definitely-wrong-password",
+            "--insecure",
             "describe",
         ])
         .output()
@@ -474,5 +494,214 @@ fn auth_failure_exits_nonzero_and_prints_error() {
     assert!(
         err.contains("authentication") || err.contains("401"),
         "expected auth error message; got: {err}"
+    );
+}
+
+struct Purge {
+    object: &'static str,
+    id: String,
+}
+
+impl Drop for Purge {
+    fn drop(&mut self) {
+        let _ = run_args(&["delete", self.object, "--ids", &self.id]);
+    }
+}
+
+struct DomainTree(String);
+
+impl Drop for DomainTree {
+    fn drop(&mut self) {
+        delete_ids(
+            "DkimSignature",
+            &ids_where("DkimSignature", &format!("domainId={}", self.0)),
+        );
+        delete_id("Domain", &self.0);
+    }
+}
+
+fn create_id(args: &[&str]) -> String {
+    create_capture_id(args).expect("create should return an id")
+}
+
+#[test]
+fn query_where_equality_returns_only_the_matching_row() {
+    require_server!();
+    let suffix = unique_suffix();
+    let a = format!("weqa-{suffix}.example.com");
+    let b = format!("weqb-{suffix}.example.com");
+    let ida = create_id(&["create", "Domain", "--field", &format!("name={a}")]);
+    let idb = create_id(&["create", "Domain", "--field", &format!("name={b}")]);
+    let _ta = DomainTree(ida);
+    let _tb = DomainTree(idb);
+
+    let out = run_args(&["query", "Domain", "--where", &format!("name={a}"), "--fields", "id,name", "--json"]);
+    assert_ok(&out, "query --where equality");
+    let names: Vec<String> = ndjson_field(&out, "name");
+    assert_eq!(names, vec![a.clone()], "equality must return exactly the one matching domain");
+}
+
+#[test]
+fn query_empty_result_exits_cleanly_with_no_rows() {
+    require_server!();
+    let out = run_args(&[
+        "query",
+        "Domain",
+        "--where",
+        "name=definitely-absent-zzz.invalid",
+        "--fields",
+        "id,name",
+        "--json",
+    ]);
+    assert_ok(&out, "query with no matches must still exit 0");
+    assert!(
+        stdout_string(&out).trim().is_empty(),
+        "an empty result set must produce no rows"
+    );
+}
+
+#[test]
+fn query_where_comparison_on_string_field_is_rejected() {
+    require_server!();
+    let out = run_args(&["query", "Domain", "--where", "name>aaa", "--fields", "id"]);
+    assert!(
+        !out.status.success(),
+        "a comparison operator on a string field must be rejected"
+    );
+    assert!(
+        stderr_string(&out).contains("only allowed on number or datetime"),
+        "expected the operator-type rejection message: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn get_unknown_id_errors_and_field_projection_limits_output() {
+    require_server!();
+    let suffix = unique_suffix();
+    let name = format!("proj-{suffix}.example.com");
+    let id = create_id(&["create", "Domain", "--field", &format!("name={name}")]);
+    let _tree = DomainTree(id.clone());
+    assert_ok(
+        &run_args(&["update", "Domain", &id, "--field", "description=set"]),
+        "set a description",
+    );
+
+    let bad = run_args(&["get", "Domain", "definitely-not-a-real-id"]);
+    assert!(!bad.status.success(), "get of an unknown id must fail");
+
+    let out = run_args(&["get", "Domain", &id, "--fields", "name", "--json"]);
+    assert_ok(&out, "get --fields name --json");
+    let v: Value = serde_json::from_str(stdout_string(&out).trim()).expect("single json line");
+    assert_eq!(v.get("name").and_then(Value::as_str), Some(name.as_str()));
+    assert!(
+        v.get("description").is_none(),
+        "field projection must omit unrequested properties: {v}"
+    );
+}
+
+#[test]
+fn delete_stdin_json_array_and_mixed_success_failure() {
+    require_server!();
+    let suffix = unique_suffix();
+    let r1 = create_id(&["create", "MtaRoute/Local", "--field", &format!("name=delr1-{suffix}.test")]);
+    let r2 = create_id(&["create", "MtaRoute/Local", "--field", &format!("name=delr2-{suffix}.test")]);
+
+    let array = format!("[\"{r1}\",\"{r2}\"]");
+    let out = run_with_stdin(&["delete", "MtaRoute", "--stdin"], array.as_bytes());
+    assert_ok(&out, "delete --stdin JSON array");
+    assert!(
+        ids_for("MtaRoute").iter().all(|id| id != &r1 && id != &r2),
+        "both routes must be deleted via --stdin"
+    );
+
+    let r3 = create_id(&["create", "MtaRoute/Local", "--field", &format!("name=delr3-{suffix}.test")]);
+    let _g = Purge { object: "MtaRoute", id: r3.clone() };
+    let mixed = format!("{r3} bogus-missing-id");
+    let out = run_with_stdin(&["delete", "MtaRoute", "--stdin"], mixed.as_bytes());
+    assert!(
+        !out.status.success(),
+        "a mix of valid and invalid ids must exit non-zero"
+    );
+    let report = format!("{}{}", stdout_string(&out), stderr_string(&out));
+    assert!(
+        report.contains("1 deleted") && report.contains("1 failed"),
+        "expected a mixed success/failure summary: {report}"
+    );
+}
+
+#[test]
+fn create_via_json_file_and_stdin_each_succeed() {
+    require_server!();
+    let suffix = unique_suffix();
+
+    let jname = format!("srcjson-{suffix}.example.com");
+    let jid = create_id(&["create", "Domain", "--json", &format!("{{\"name\":\"{jname}\"}}")]);
+    let _jt = DomainTree(jid);
+
+    let fname = format!("srcfile-{suffix}.example.com");
+    let path = std::env::temp_dir().join(format!("itest-create-{suffix}.json"));
+    std::fs::write(&path, format!("{{\"name\":\"{fname}\"}}")).expect("write temp file");
+    let fid = create_id(&["create", "Domain", "--file", path.to_str().unwrap()]);
+    let _ft = DomainTree(fid);
+    let _ = std::fs::remove_file(&path);
+
+    let sname = format!("srcstdin-{suffix}.example.com");
+    let out = run_with_stdin(&["create", "Domain", "--stdin"], format!("{{\"name\":\"{sname}\"}}").as_bytes());
+    assert_ok(&out, "create --stdin");
+    let sid = stdout_string(&out)
+        .split_whitespace()
+        .last()
+        .expect("created id")
+        .trim_end_matches(['\n', '\r'])
+        .to_string();
+    let _st = DomainTree(sid);
+
+    for n in [&jname, &fname, &sname] {
+        assert_eq!(
+            ids_where("Domain", &format!("name={n}")).len(),
+            1,
+            "domain {n} must have been created"
+        );
+    }
+}
+
+#[test]
+fn create_slash_form_sets_variant_at_type() {
+    require_server!();
+    let _guard = state_lock();
+    let suffix = unique_suffix();
+    let domain_id = create_id(&["create", "Domain", "--field", &format!("name=slash-{suffix}.example.com")]);
+    let _tree = DomainTree(domain_id.clone());
+    let account_id = create_id(&[
+        "create",
+        "Account/User",
+        "--field",
+        &format!("name=slashu-{suffix}"),
+        "--field",
+        &format!("domainId={domain_id}"),
+    ]);
+    let _acc = Purge { object: "Account", id: account_id.clone() };
+
+    let out = run_args(&["get", "Account", &account_id, "--json"]);
+    assert_ok(&out, "get account --json");
+    let v: Value = serde_json::from_str(stdout_string(&out).trim()).expect("single json line");
+    assert_eq!(
+        v.get("@type").and_then(Value::as_str),
+        Some("User"),
+        "the slash form Account/User must create a User-variant object"
+    );
+}
+
+#[test]
+fn describe_enum_lists_its_variants() {
+    require_server!();
+    let out = run_args(&["describe", "MtaIpStrategy"]);
+    assert_ok(&out, "describe <EnumName>");
+    let s = stdout_string(&out);
+    assert!(s.contains("(enum)"), "expected enum header: {s}");
+    assert!(
+        s.contains("v4ThenV6"),
+        "expected enum variants to be listed: {s}"
     );
 }

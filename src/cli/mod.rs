@@ -72,7 +72,7 @@ pub enum Command {
     Delete(DeleteArgs),
     /// Describe objects and enums from the schema
     Describe(DescribeArgs),
-    /// Apply a bulk plan of creates, updates, and destroys from a JSON file
+    /// Apply a bulk plan of creates, updates, upserts, and destroys from a JSON file
     Apply(ApplyArgs),
     /// Snapshot one or more object types into a plan file consumable by `apply`
     Snapshot(SnapshotArgs),
@@ -205,10 +205,6 @@ pub struct SnapshotArgs {
     /// Write the plan to this path instead of stdout
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
-
-    /// Skip the destroy block at the top of the plan
-    #[arg(long)]
-    pub no_destroys: bool,
 
     /// Include secret field values as returned by the server (default: strip)
     #[arg(long)]

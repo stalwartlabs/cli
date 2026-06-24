@@ -9,11 +9,11 @@ use crate::app::error::{CliError, CliResult};
 use crate::cli::ApplyArgs;
 use crate::jmap::Jmap;
 use crate::jmap::errors::SetError;
-use crate::jmap::protocol::CallResponse;
+use crate::jmap::protocol::{CallResponse, check_response};
 use crate::render::Ansi;
 use crate::render::set_error;
 use crate::schema::resolve;
-use crate::schema::{ObjectType, Schema};
+use crate::schema::{Field, FieldType, Fields, ObjectSchema, ObjectType, Schema, StringFormat};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +39,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
         created_ids: HashMap::new(),
         summary: Summary::new(&plan),
     };
+    let mut matcher = Matcher::new();
 
     for op in plan.ops.iter().rev() {
         if let ResolvedOp::Destroy {
@@ -68,6 +69,38 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
     for op in &plan.ops {
         match op {
             ResolvedOp::Destroy { .. } => {}
+            ResolvedOp::Upsert {
+                canonical,
+                match_on,
+                value,
+                index,
+            } => {
+                match execute_upsert(
+                    ctx,
+                    &jmap,
+                    canonical,
+                    match_on.as_deref(),
+                    value,
+                    &mut state,
+                    &mut matcher,
+                    *index,
+                    &reporter,
+                ) {
+                    Ok((created, updated)) => {
+                        state.summary.created += created;
+                        state.summary.updated += updated;
+                        reporter.op_ok(*index, "upsert", canonical, created + updated);
+                    }
+                    Err(e) => {
+                        state.summary.failed += 1;
+                        reporter.op_err(*index, "upsert", canonical, &e);
+                        if !args.continue_on_error {
+                            reporter.final_summary(&state.summary);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
             ResolvedOp::Update {
                 canonical,
                 id,
@@ -184,6 +217,13 @@ enum RawOp {
         #[serde(default)]
         value: Map<String, Value>,
     },
+    Upsert {
+        object: String,
+        #[serde(default, rename = "matchOn")]
+        match_on: Option<Vec<String>>,
+        #[serde(default)]
+        value: Map<String, Value>,
+    },
 }
 
 enum ResolvedOp {
@@ -203,6 +243,12 @@ enum ResolvedOp {
         value: Map<String, Value>,
         index: usize,
     },
+    Upsert {
+        canonical: String,
+        match_on: Option<Vec<String>>,
+        value: Map<String, Value>,
+        index: usize,
+    },
 }
 
 struct Plan {
@@ -211,6 +257,8 @@ struct Plan {
     updates: usize,
     creates: usize,
     create_objects: usize,
+    upserts: usize,
+    upsert_objects: usize,
 }
 
 impl Plan {
@@ -220,6 +268,8 @@ impl Plan {
         let mut updates = 0usize;
         let mut creates = 0usize;
         let mut create_objects = 0usize;
+        let mut upserts = 0usize;
+        let mut upsert_objects = 0usize;
 
         for (index, r) in raw.into_iter().enumerate() {
             match r {
@@ -290,6 +340,58 @@ impl Plan {
                         index,
                     });
                 }
+                RawOp::Upsert {
+                    object,
+                    match_on,
+                    value,
+                } => {
+                    let canonical = resolve::require_object(schema, &object)?;
+                    if matches!(
+                        schema.objects.get(canonical),
+                        Some(ObjectType::Singleton { .. })
+                    ) {
+                        return Err(CliError::msg(format!(
+                            "cannot upsert singleton `{}` (operation #{}); use update instead",
+                            resolve::display_name(canonical),
+                            index + 1,
+                        )));
+                    }
+                    if value.is_empty() {
+                        return Err(CliError::msg(format!(
+                            "upsert operation #{} has an empty `value` map (no objects to upsert)",
+                            index + 1,
+                        )));
+                    }
+                    if let Some(keys) = &match_on
+                        && keys.is_empty()
+                    {
+                        return Err(CliError::msg(format!(
+                            "upsert operation #{} has an empty `matchOn` list",
+                            index + 1,
+                        )));
+                    }
+
+                    let mut normalised = Map::new();
+                    for (k, v) in value {
+                        let key = k.strip_prefix('#').map(String::from).unwrap_or(k);
+                        if normalised.contains_key(&key) {
+                            return Err(CliError::msg(format!(
+                                "upsert operation #{} has duplicate id `{}`",
+                                index + 1,
+                                key
+                            )));
+                        }
+                        normalised.insert(key, v);
+                    }
+                    upserts += 1;
+                    upsert_objects += normalised.len();
+                    ops.push(ResolvedOp::Upsert {
+                        canonical: canonical.to_string(),
+                        match_on,
+                        value: normalised,
+                        index,
+                    });
+                }
             }
         }
 
@@ -299,6 +401,8 @@ impl Plan {
             updates,
             creates,
             create_objects,
+            upserts,
+            upsert_objects,
         })
     }
 }
@@ -338,6 +442,8 @@ struct Summary {
     planned_updates: usize,
     planned_creates: usize,
     planned_create_objects: usize,
+    planned_upserts: usize,
+    planned_upsert_objects: usize,
     destroyed: usize,
     updated: usize,
     created: usize,
@@ -351,6 +457,8 @@ impl Summary {
             planned_updates: plan.updates,
             planned_creates: plan.creates,
             planned_create_objects: plan.create_objects,
+            planned_upserts: plan.upserts,
+            planned_upsert_objects: plan.upsert_objects,
             destroyed: 0,
             updated: 0,
             created: 0,
@@ -505,6 +613,343 @@ fn fetch_all_ids(
         anchor = last;
     }
     Ok(all)
+}
+
+enum MatchKey {
+    Props(Vec<String>),
+    Value,
+}
+
+fn resolve_match_key(schema: &Schema, canonical: &str, match_on: Option<&[String]>) -> MatchKey {
+    if let Some(keys) = match_on {
+        return MatchKey::Props(keys.to_vec());
+    }
+    if let Some(label) = schema
+        .lists
+        .get(canonical)
+        .and_then(|l| l.label_property.as_ref())
+    {
+        return MatchKey::Props(vec![label.clone()]);
+    }
+    MatchKey::Value
+}
+
+fn is_multi_variant(schema: &Schema, canonical: &str) -> bool {
+    matches!(
+        schema.schemas.get(canonical),
+        Some(ObjectSchema::Multiple { .. })
+    )
+}
+
+fn fields_for<'a>(schema: &'a Schema, canonical: &str, at_type: Option<&str>) -> Option<&'a Fields> {
+    match schema.schemas.get(canonical)? {
+        ObjectSchema::Single { schema_name } => schema.fields.get(schema_name),
+        ObjectSchema::Multiple { variants } => {
+            let at = at_type?;
+            let variant = variants.iter().find(|v| v.name == at)?;
+            variant
+                .schema_name
+                .as_ref()
+                .and_then(|sn| schema.fields.get(sn))
+        }
+    }
+}
+
+fn field_is_secret_scalar(t: &FieldType) -> bool {
+    matches!(
+        t,
+        FieldType::String {
+            format: StringFormat::Secret | StringFormat::SecretText,
+            ..
+        }
+    )
+}
+
+fn is_comparable_scalar(field: &Field) -> bool {
+    if matches!(field.update, crate::schema::FieldUpdate::ServerSet) {
+        return false;
+    }
+    if field_is_secret_scalar(&field.typ) {
+        return false;
+    }
+    matches!(
+        field.typ,
+        FieldType::String { .. }
+            | FieldType::Number { .. }
+            | FieldType::Boolean
+            | FieldType::Enum { .. }
+            | FieldType::UtcDateTime { .. }
+    )
+}
+
+struct Matcher {
+    objects: HashMap<String, Vec<Map<String, Value>>>,
+    warned_value_match: HashSet<String>,
+}
+
+impl Matcher {
+    fn new() -> Self {
+        Matcher {
+            objects: HashMap::new(),
+            warned_value_match: HashSet::new(),
+        }
+    }
+
+    fn ensure(&mut self, ctx: &Context, jmap: &Jmap, canonical: &str) -> CliResult<()> {
+        if self.objects.contains_key(canonical) {
+            return Ok(());
+        }
+        let objs = fetch_all_objects(ctx, jmap, canonical)?;
+        self.objects.insert(canonical.to_string(), objs);
+        Ok(())
+    }
+
+    fn objects_for(&self, canonical: &str) -> &[Map<String, Value>] {
+        self.objects
+            .get(canonical)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+fn fetch_all_objects(
+    ctx: &Context,
+    jmap: &Jmap,
+    canonical: &str,
+) -> CliResult<Vec<Map<String, Value>>> {
+    let query_method = format!("{canonical}/query");
+    let get_method = format!("{canonical}/get");
+    let limit = ctx.session.max_objects_in_get.max(1);
+    let mut anchor: Option<String> = None;
+    let mut all = Vec::new();
+
+    loop {
+        let mut q_args = Map::new();
+        q_args.insert("filter".into(), json!({}));
+        q_args.insert("limit".into(), Value::from(limit));
+        if let Some(a) = &anchor {
+            q_args.insert("anchor".into(), Value::String(a.clone()));
+            q_args.insert("anchorOffset".into(), Value::from(1));
+        }
+        let get_args = json!({
+            "#ids": { "resultOf": "q", "name": query_method, "path": "/ids" },
+            "properties": Value::Null,
+        });
+
+        let resp = jmap.call_with(
+            vec![
+                (query_method.clone(), Value::Object(q_args), "q".into()),
+                (get_method.clone(), get_args, "g".into()),
+            ],
+            None,
+        )?;
+        if resp.responses.len() != 2 {
+            return Err(CliError::UnexpectedResponse(format!(
+                "expected 2 responses, got {}",
+                resp.responses.len()
+            )));
+        }
+        let mut iter = resp.responses.into_iter();
+        let q_resp = iter
+            .next()
+            .ok_or_else(|| CliError::UnexpectedResponse("missing query response".into()))?;
+        let g_resp = iter
+            .next()
+            .ok_or_else(|| CliError::UnexpectedResponse("missing get response".into()))?;
+        check_response(q_resp, &query_method)?;
+        let g_result = check_response(g_resp, &get_method)?;
+
+        let Some(list) = g_result.get("list").and_then(Value::as_array) else {
+            break;
+        };
+        if list.is_empty() {
+            break;
+        }
+        let last_id = list
+            .last()
+            .and_then(|v| v.get("id").and_then(Value::as_str))
+            .map(String::from);
+        let returned = list.len();
+        for item in list {
+            if let Some(obj) = item.as_object() {
+                all.push(obj.clone());
+            }
+        }
+        if returned < limit {
+            break;
+        }
+        match last_id {
+            Some(a) => anchor = Some(a),
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+fn find_match(
+    matcher: &Matcher,
+    schema: &Schema,
+    canonical: &str,
+    body: &Map<String, Value>,
+    key: &MatchKey,
+) -> CliResult<Option<String>> {
+    let multi = is_multi_variant(schema, canonical);
+    let at_type = body.get("@type").and_then(Value::as_str);
+    if multi && at_type.is_none() {
+        return Err(CliError::msg(format!(
+            "{}: upsert entry is missing `@type` (required to match a multi-variant object)",
+            resolve::display_name(canonical),
+        )));
+    }
+
+    let candidates = matcher.objects_for(canonical).iter().filter(|o| {
+        if multi {
+            o.get("@type").and_then(Value::as_str) == at_type
+        } else {
+            true
+        }
+    });
+
+    match key {
+        MatchKey::Props(props) => {
+            for p in props {
+                if !body.contains_key(p) {
+                    return Err(CliError::msg(format!(
+                        "{}: match property `{}` is missing from the object body",
+                        resolve::display_name(canonical),
+                        p,
+                    )));
+                }
+            }
+            let mut matched: Option<String> = None;
+            let mut count = 0usize;
+            for cand in candidates {
+                if props.iter().all(|p| cand.get(p) == body.get(p)) {
+                    count += 1;
+                    if matched.is_none() {
+                        matched = cand.get("id").and_then(Value::as_str).map(String::from);
+                    }
+                }
+            }
+            if count > 1 {
+                return Err(CliError::msg(format!(
+                    "{}: ambiguous upsert; {} existing objects match on {}",
+                    resolve::display_name(canonical),
+                    count,
+                    props.join(", "),
+                )));
+            }
+            Ok(matched)
+        }
+        MatchKey::Value => {
+            let fields = fields_for(schema, canonical, at_type).ok_or_else(|| {
+                CliError::msg(format!(
+                    "{}: cannot determine a match key (no label property and no schema fields); \
+                     add a `matchOn` to the plan",
+                    resolve::display_name(canonical),
+                ))
+            })?;
+            let props: Vec<&str> = fields
+                .properties
+                .iter()
+                .filter(|(_, f)| is_comparable_scalar(f))
+                .map(|(n, _)| n.as_str())
+                .collect();
+            if props.is_empty() {
+                return Err(CliError::msg(format!(
+                    "{}: no comparable properties to match on; add a `matchOn` to the plan",
+                    resolve::display_name(canonical),
+                )));
+            }
+            for cand in candidates {
+                if props.iter().all(|p| cand.get(*p) == body.get(*p)) {
+                    return Ok(cand.get("id").and_then(Value::as_str).map(String::from));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_upsert(
+    ctx: &Context,
+    jmap: &Jmap,
+    canonical: &str,
+    match_on: Option<&[String]>,
+    value: &Map<String, Value>,
+    state: &mut State,
+    matcher: &mut Matcher,
+    op_index: usize,
+    reporter: &Reporter,
+) -> CliResult<(usize, usize)> {
+    matcher.ensure(ctx, jmap, canonical)?;
+    let key = resolve_match_key(&ctx.schema, canonical, match_on);
+    if matches!(key, MatchKey::Value) && matcher.warned_value_match.insert(canonical.to_string()) {
+        reporter.value_match_warning(canonical);
+    }
+
+    let mut to_create: Map<String, Value> = Map::new();
+    let mut to_update: Vec<(String, Value)> = Vec::new();
+    for (client_id, body_val) in value {
+        let body = body_val.as_object().ok_or_else(|| {
+            CliError::msg(format!(
+                "{}: upsert entry `{}` is not a JSON object",
+                resolve::display_name(canonical),
+                client_id,
+            ))
+        })?;
+        match find_match(matcher, &ctx.schema, canonical, body, &key)? {
+            Some(server_id) => {
+                state.created_ids.insert(client_id.clone(), server_id.clone());
+                let at_type = body.get("@type").and_then(Value::as_str);
+                let mut patch = body.clone();
+                patch.remove("@type");
+                if let Some(fields) = fields_for(&ctx.schema, canonical, at_type) {
+                    patch.retain(|k, _| {
+                        fields
+                            .properties
+                            .get(k)
+                            .map(|f| {
+                                !matches!(
+                                    f.update,
+                                    crate::schema::FieldUpdate::Immutable
+                                        | crate::schema::FieldUpdate::ServerSet
+                                )
+                            })
+                            .unwrap_or(true)
+                    });
+                }
+                if !patch.is_empty() {
+                    to_update.push((server_id, Value::Object(patch)));
+                }
+            }
+            None => {
+                to_create.insert(client_id.clone(), body_val.clone());
+            }
+        }
+    }
+
+    let mut created = 0usize;
+    if !to_create.is_empty() {
+        let batch_size = ctx.session.max_objects_in_set.max(1);
+        created = execute_create(
+            jmap,
+            canonical,
+            &to_create,
+            batch_size,
+            &mut state.created_ids,
+            op_index,
+            reporter,
+        )?;
+    }
+
+    let mut updated = 0usize;
+    for (server_id, body) in &to_update {
+        updated += execute_update(jmap, canonical, server_id, body, &mut state.created_ids)?;
+    }
+
+    Ok((created, updated))
 }
 
 fn execute_update(
@@ -703,13 +1148,29 @@ impl Reporter {
         let mut err = std::io::stderr().lock();
         let _ = writeln!(
             err,
-            "{}Plan:{} {} destroy, {} update, {} create ({} objects)",
+            "{}Plan:{} {} destroy, {} update, {} create, {} upsert ({} objects)",
             self.ansi.bold(),
             self.ansi.reset(),
             plan.destroys,
             plan.updates,
             plan.creates,
-            plan.create_objects,
+            plan.upserts,
+            plan.create_objects + plan.upsert_objects,
+        );
+    }
+
+    fn value_match_warning(&self, canonical: &str) {
+        if self.quiet {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(
+            err,
+            "{}warning:{} {} has no match key; matching existing objects by value \
+             (a changed object will be created as a new one)",
+            self.ansi.yellow(),
+            self.ansi.reset(),
+            resolve::display_name(canonical),
         );
     }
 
@@ -792,6 +1253,8 @@ impl Reporter {
                     "updates": s.planned_updates,
                     "creates": s.planned_creates,
                     "create_objects": s.planned_create_objects,
+                    "upserts": s.planned_upserts,
+                    "upsert_objects": s.planned_upsert_objects,
                 },
                 "done": {
                     "destroyed": s.destroyed,
@@ -823,6 +1286,7 @@ fn past_tense(kind: &str) -> &'static str {
         "destroy" => "destroyed",
         "update" => "updated",
         "create" => "created",
+        "upsert" => "upserted",
         _ => "done",
     }
 }
@@ -922,5 +1386,208 @@ mod tests {
         let err = parse_ndjson_plan(input).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("line 1"));
+    }
+
+    fn obj_type() -> ObjectType {
+        ObjectType::Object {
+            description: String::new(),
+            permission_prefix: String::new(),
+            enterprise: false,
+        }
+    }
+
+    fn string_field() -> Field {
+        Field {
+            description: String::new(),
+            typ: FieldType::String {
+                format: StringFormat::String,
+                min_length: None,
+                max_length: None,
+                nullable: false,
+            },
+            update: crate::schema::FieldUpdate::Mutable,
+            enterprise: false,
+        }
+    }
+
+    fn domain_schema() -> Schema {
+        use crate::schema::{Fields, List};
+        let mut s = Schema::default();
+        s.objects.insert("x:Domain".into(), obj_type());
+        s.schemas.insert(
+            "x:Domain".into(),
+            ObjectSchema::Single {
+                schema_name: "x:Domain".into(),
+            },
+        );
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), string_field());
+        props.insert("description".to_string(), string_field());
+        s.fields.insert(
+            "x:Domain".into(),
+            Fields {
+                properties: props,
+                defaults: HashMap::new(),
+            },
+        );
+        s.lists.insert(
+            "x:Domain".into(),
+            List {
+                title: String::new(),
+                subtitle: String::new(),
+                label_property: Some("name".into()),
+                singular_name: String::new(),
+                plural_name: String::new(),
+                columns: vec![],
+                filters: vec![],
+                filters_static: HashMap::new(),
+                sort: vec![],
+                mass_actions: vec![],
+                item_actions: vec![],
+            },
+        );
+        s
+    }
+
+    fn matcher_with(objs: Vec<Value>) -> Matcher {
+        let mut m = Matcher::new();
+        m.objects.insert(
+            "x:Domain".into(),
+            objs.into_iter()
+                .filter_map(|v| v.as_object().cloned())
+                .collect(),
+        );
+        m
+    }
+
+    #[test]
+    fn parses_upsert_op_with_match_on() {
+        let input = "{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\
+                     \"value\":{\"d1\":{\"name\":\"a.com\"}}}\n";
+        let ops = parse_ndjson_plan(input).unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            RawOp::Upsert {
+                object,
+                match_on,
+                value,
+            } => {
+                assert_eq!(object, "Domain");
+                assert_eq!(match_on.as_deref(), Some(["name".to_string()].as_slice()));
+                assert!(value.contains_key("d1"));
+            }
+            other => panic!("expected upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_match_key_prefers_match_on_then_label_then_value() {
+        let s = domain_schema();
+        assert!(matches!(
+            resolve_match_key(&s, "x:Domain", Some(&["description".to_string()])),
+            MatchKey::Props(p) if p == ["description"]
+        ));
+        assert!(matches!(
+            resolve_match_key(&s, "x:Domain", None),
+            MatchKey::Props(p) if p == ["name"]
+        ));
+        let mut bare = Schema::default();
+        bare.objects.insert("x:Tracer".into(), obj_type());
+        assert!(matches!(
+            resolve_match_key(&bare, "x:Tracer", None),
+            MatchKey::Value
+        ));
+    }
+
+    #[test]
+    fn find_match_by_label_matches_unique() {
+        let s = domain_schema();
+        let m = matcher_with(vec![
+            json!({ "id": "srv1", "name": "a.com" }),
+            json!({ "id": "srv2", "name": "b.com" }),
+        ]);
+        let body = json!({ "name": "b.com" }).as_object().unwrap().clone();
+        let key = resolve_match_key(&s, "x:Domain", None);
+        let got = find_match(&m, &s, "x:Domain", &body, &key).unwrap();
+        assert_eq!(got.as_deref(), Some("srv2"));
+
+        let body = json!({ "name": "nope.com" }).as_object().unwrap().clone();
+        let got = find_match(&m, &s, "x:Domain", &body, &key).unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn find_match_ambiguous_is_error() {
+        let s = domain_schema();
+        let m = matcher_with(vec![
+            json!({ "id": "srv1", "name": "dup.com" }),
+            json!({ "id": "srv2", "name": "dup.com" }),
+        ]);
+        let body = json!({ "name": "dup.com" }).as_object().unwrap().clone();
+        let key = resolve_match_key(&s, "x:Domain", None);
+        let err = find_match(&m, &s, "x:Domain", &body, &key).unwrap_err();
+        assert!(format!("{err}").contains("ambiguous"));
+    }
+
+    #[test]
+    fn find_match_missing_key_property_is_error() {
+        let s = domain_schema();
+        let m = matcher_with(vec![json!({ "id": "srv1", "name": "a.com" })]);
+        let body = json!({ "description": "x" }).as_object().unwrap().clone();
+        let key = resolve_match_key(&s, "x:Domain", None);
+        let err = find_match(&m, &s, "x:Domain", &body, &key).unwrap_err();
+        assert!(format!("{err}").contains("match property `name`"));
+    }
+
+    #[test]
+    fn find_match_value_fallback_matches_on_scalars() {
+        let mut s = domain_schema();
+        s.lists.get_mut("x:Domain").unwrap().label_property = None;
+        let m = matcher_with(vec![
+            json!({ "id": "srv1", "name": "a.com", "description": "one" }),
+            json!({ "id": "srv2", "name": "b.com", "description": "two" }),
+        ]);
+        let key = resolve_match_key(&s, "x:Domain", None);
+        assert!(matches!(key, MatchKey::Value));
+        let body = json!({ "name": "b.com", "description": "two" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let got = find_match(&m, &s, "x:Domain", &body, &key).unwrap();
+        assert_eq!(got.as_deref(), Some("srv2"));
+
+        let changed = json!({ "name": "b.com", "description": "CHANGED" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let got = find_match(&m, &s, "x:Domain", &changed, &key).unwrap();
+        assert_eq!(got, None, "a changed scalar must not match (creates new)");
+    }
+
+    #[test]
+    fn upsert_singleton_is_rejected() {
+        let mut s = Schema::default();
+        s.objects.insert(
+            "x:SystemSettings".into(),
+            ObjectType::Singleton {
+                description: String::new(),
+                permission_prefix: String::new(),
+                enterprise: false,
+            },
+        );
+        let raw = vec![RawOp::Upsert {
+            object: "SystemSettings".into(),
+            match_on: None,
+            value: {
+                let mut m = Map::new();
+                m.insert("s1".into(), json!({ "x": 1 }));
+                m
+            },
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected an error for upsert on a singleton"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("cannot upsert singleton"));
     }
 }
