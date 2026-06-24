@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 mod common;
 
 use serde_json::Value;
@@ -21,7 +27,15 @@ fn server() -> &'static stalwart::Stalwart {
 
 fn run_args(args: &[&str]) -> Output {
     Command::new(bin())
-        .args(["--url", server().base_url(), "--user", USER, "--password", PASS, "--insecure"])
+        .args([
+            "--url",
+            server().base_url(),
+            "--user",
+            USER,
+            "--password",
+            PASS,
+            "--insecure",
+        ])
         .args(args)
         .output()
         .expect("failed to spawn stalwart-cli")
@@ -29,7 +43,15 @@ fn run_args(args: &[&str]) -> Output {
 
 fn run_with_stdin(args: &[&str], stdin_data: &[u8]) -> Output {
     let mut child = Command::new(bin())
-        .args(["--url", server().base_url(), "--user", USER, "--password", PASS, "--insecure"])
+        .args([
+            "--url",
+            server().base_url(),
+            "--user",
+            USER,
+            "--password",
+            PASS,
+            "--insecure",
+        ])
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -414,7 +436,10 @@ fn create_duplicate_renders_set_error_and_exits_nonzero() {
         "expected the offending property to render: {err}"
     );
 
-    delete_ids("DkimSignature", &ids_where("DkimSignature", &format!("domainId={id}")));
+    delete_ids(
+        "DkimSignature",
+        &ids_where("DkimSignature", &format!("domainId={id}")),
+    );
     delete_id("Domain", &id);
 }
 
@@ -535,10 +560,22 @@ fn query_where_equality_returns_only_the_matching_row() {
     let _ta = DomainTree(ida);
     let _tb = DomainTree(idb);
 
-    let out = run_args(&["query", "Domain", "--where", &format!("name={a}"), "--fields", "id,name", "--json"]);
+    let out = run_args(&[
+        "query",
+        "Domain",
+        "--where",
+        &format!("name={a}"),
+        "--fields",
+        "id,name",
+        "--json",
+    ]);
     assert_ok(&out, "query --where equality");
     let names: Vec<String> = ndjson_field(&out, "name");
-    assert_eq!(names, vec![a.clone()], "equality must return exactly the one matching domain");
+    assert_eq!(
+        names,
+        vec![a.clone()],
+        "equality must return exactly the one matching domain"
+    );
 }
 
 #[test]
@@ -604,8 +641,18 @@ fn get_unknown_id_errors_and_field_projection_limits_output() {
 fn delete_stdin_json_array_and_mixed_success_failure() {
     require_server!();
     let suffix = unique_suffix();
-    let r1 = create_id(&["create", "MtaRoute/Local", "--field", &format!("name=delr1-{suffix}.test")]);
-    let r2 = create_id(&["create", "MtaRoute/Local", "--field", &format!("name=delr2-{suffix}.test")]);
+    let r1 = create_id(&[
+        "create",
+        "MtaRoute/Local",
+        "--field",
+        &format!("name=delr1-{suffix}.test"),
+    ]);
+    let r2 = create_id(&[
+        "create",
+        "MtaRoute/Local",
+        "--field",
+        &format!("name=delr2-{suffix}.test"),
+    ]);
 
     let array = format!("[\"{r1}\",\"{r2}\"]");
     let out = run_with_stdin(&["delete", "MtaRoute", "--stdin"], array.as_bytes());
@@ -615,8 +662,16 @@ fn delete_stdin_json_array_and_mixed_success_failure() {
         "both routes must be deleted via --stdin"
     );
 
-    let r3 = create_id(&["create", "MtaRoute/Local", "--field", &format!("name=delr3-{suffix}.test")]);
-    let _g = Purge { object: "MtaRoute", id: r3.clone() };
+    let r3 = create_id(&[
+        "create",
+        "MtaRoute/Local",
+        "--field",
+        &format!("name=delr3-{suffix}.test"),
+    ]);
+    let _g = Purge {
+        object: "MtaRoute",
+        id: r3.clone(),
+    };
     let mixed = format!("{r3} bogus-missing-id");
     let out = run_with_stdin(&["delete", "MtaRoute", "--stdin"], mixed.as_bytes());
     assert!(
@@ -636,7 +691,12 @@ fn create_via_json_file_and_stdin_each_succeed() {
     let suffix = unique_suffix();
 
     let jname = format!("srcjson-{suffix}.example.com");
-    let jid = create_id(&["create", "Domain", "--json", &format!("{{\"name\":\"{jname}\"}}")]);
+    let jid = create_id(&[
+        "create",
+        "Domain",
+        "--json",
+        &format!("{{\"name\":\"{jname}\"}}"),
+    ]);
     let _jt = DomainTree(jid);
 
     let fname = format!("srcfile-{suffix}.example.com");
@@ -647,7 +707,10 @@ fn create_via_json_file_and_stdin_each_succeed() {
     let _ = std::fs::remove_file(&path);
 
     let sname = format!("srcstdin-{suffix}.example.com");
-    let out = run_with_stdin(&["create", "Domain", "--stdin"], format!("{{\"name\":\"{sname}\"}}").as_bytes());
+    let out = run_with_stdin(
+        &["create", "Domain", "--stdin"],
+        format!("{{\"name\":\"{sname}\"}}").as_bytes(),
+    );
     assert_ok(&out, "create --stdin");
     let sid = stdout_string(&out)
         .split_whitespace()
@@ -671,7 +734,12 @@ fn create_slash_form_sets_variant_at_type() {
     require_server!();
     let _guard = state_lock();
     let suffix = unique_suffix();
-    let domain_id = create_id(&["create", "Domain", "--field", &format!("name=slash-{suffix}.example.com")]);
+    let domain_id = create_id(&[
+        "create",
+        "Domain",
+        "--field",
+        &format!("name=slash-{suffix}.example.com"),
+    ]);
     let _tree = DomainTree(domain_id.clone());
     let account_id = create_id(&[
         "create",
@@ -681,7 +749,10 @@ fn create_slash_form_sets_variant_at_type() {
         "--field",
         &format!("domainId={domain_id}"),
     ]);
-    let _acc = Purge { object: "Account", id: account_id.clone() };
+    let _acc = Purge {
+        object: "Account",
+        id: account_id.clone(),
+    };
 
     let out = run_args(&["get", "Account", &account_id, "--json"]);
     assert_ok(&out, "get account --json");

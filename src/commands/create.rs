@@ -174,9 +174,7 @@ fn walk_fields<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{
-        Field, FieldType, FieldUpdate, ObjectVariant, Schema, StringFormat,
-    };
+    use crate::schema::{Field, FieldType, FieldUpdate, ObjectVariant, Schema, StringFormat};
     use std::collections::HashMap;
 
     fn string_field() -> Field {

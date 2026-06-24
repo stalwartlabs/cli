@@ -5,9 +5,7 @@
  */
 
 use crate::app::error::{CliError, CliResult};
-use crate::schema::{
-    FieldType, MapValueType, ObjectSchema, ObjectType, ScalarType, Schema,
-};
+use crate::schema::{FieldType, MapValueType, ObjectSchema, ObjectType, ScalarType, Schema};
 
 pub fn resolve_object<'a>(
     schema: &'a Schema,
@@ -45,9 +43,7 @@ pub fn require_object<'a>(schema: &'a Schema, raw: &str) -> CliResult<&'a str> {
         let display = display_name(canonical_embedded).to_string();
         let holders = top_level_holders_of(schema, canonical_embedded);
         let msg = match holders.as_slice() {
-            [] => format!(
-                "`{display}` is an embedded sub-object, not a top-level object"
-            ),
+            [] => format!("`{display}` is an embedded sub-object, not a top-level object"),
             [single] => {
                 let tail = first_holder_field(schema, single, canonical_embedded)
                     .map(|f| format!("its {f}"))

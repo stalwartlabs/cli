@@ -12,6 +12,8 @@ pub type CliResult<T> = Result<T, CliError>;
 pub enum CliError {
     #[error("no URL provided (use --url or STALWART_URL)")]
     MissingUrl,
+    #[error("URL '{0}' is missing a scheme; prefix it with https:// or http://")]
+    MissingUrlScheme(String),
     #[error("no credentials provided (use --user / --password or --api-key)")]
     MissingCredentials,
     #[error("no password provided and stdin is not a tty")]

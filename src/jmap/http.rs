@@ -212,8 +212,8 @@ fn header_str(value: Option<&HeaderValue>) -> Option<&str> {
 }
 
 fn read_schema_body(resp: Response) -> CliResult<Vec<u8>> {
-    let encoding = header_str(resp.headers().get(CONTENT_ENCODING))
-        .map(|s| s.trim().to_ascii_lowercase());
+    let encoding =
+        header_str(resp.headers().get(CONTENT_ENCODING)).map(|s| s.trim().to_ascii_lowercase());
     let bytes = resp.bytes()?;
     decode_schema_body(&bytes, encoding.as_deref())
 }
@@ -347,10 +347,7 @@ mod tests {
 
     #[test]
     fn snippet_escapes_control_characters() {
-        assert_eq!(
-            snippet(b"a\nb\tc\rd", 200),
-            "\"a\\nb\\tc\\rd\"",
-        );
+        assert_eq!(snippet(b"a\nb\tc\rd", 200), "\"a\\nb\\tc\\rd\"",);
     }
 
     #[test]

@@ -185,7 +185,10 @@ mod tests {
         let outcome = interpret_update_response(&resp, "abc", "x:Domain")?;
         match outcome {
             UpdateOutcome::Failed(v) => {
-                assert_eq!(v.get("type").and_then(Value::as_str), Some("invalidProperties"));
+                assert_eq!(
+                    v.get("type").and_then(Value::as_str),
+                    Some("invalidProperties")
+                );
             }
             _ => return Err(CliError::msg("expected Failed")),
         }

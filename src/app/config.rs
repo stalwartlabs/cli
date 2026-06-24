@@ -25,10 +25,14 @@ impl Config {
     pub fn resolve(args: &GlobalArgs) -> CliResult<Self> {
         let url = args
             .url
-            .clone()
+            .as_ref()
             .ok_or(CliError::MissingUrl)?
             .trim_end_matches('/')
             .to_string();
+
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(CliError::MissingUrlScheme(url));
+        }
 
         let auth = resolve_auth(args)?;
 
@@ -36,8 +40,7 @@ impl Config {
             && std::env::var_os("NO_COLOR").is_none()
             && std::io::stdout().is_terminal();
 
-        let debug = args.debug
-            || std::env::var_os("STALWART_DEBUG").is_some_and(|v| !v.is_empty());
+        let debug = args.debug || std::env::var_os("STALWART_DEBUG").is_some_and(|v| !v.is_empty());
 
         Ok(Config {
             url,

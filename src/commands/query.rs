@@ -354,8 +354,7 @@ impl Pager {
         self.args.remove("calculateTotal");
         self.args
             .insert("anchor".to_string(), Value::String(last_id));
-        self.args
-            .insert("anchorOffset".to_string(), Value::from(1));
+        self.args.insert("anchorOffset".to_string(), Value::from(1));
     }
 
     fn query_args(&self) -> Value {

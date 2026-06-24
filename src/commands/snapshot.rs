@@ -53,7 +53,14 @@ pub fn run(ctx: &Context, args: &SnapshotArgs) -> CliResult<()> {
     let mut cache = FetchCache::new();
     for shard in plan.iter_non_singletons() {
         let deferred = plan.deferred_for(&shard.key);
-        emit_upsert(&mut sink, &snap_ctx, shard, &deferred, &mut cache, &mut reporter)?;
+        emit_upsert(
+            &mut sink,
+            &snap_ctx,
+            shard,
+            &deferred,
+            &mut cache,
+            &mut reporter,
+        )?;
     }
 
     emit_deferred_updates(&mut sink, &snap_ctx, &plan, &mut cache)?;
@@ -322,7 +329,9 @@ fn collect_ft_refs_multi(
     visited: &mut HashSet<String>,
 ) {
     match t {
-        FieldType::ObjectId { object_name, .. } => push_shard_refs_multi(schema, object_name, multi, out),
+        FieldType::ObjectId { object_name, .. } => {
+            push_shard_refs_multi(schema, object_name, multi, out)
+        }
         FieldType::Set {
             class: ScalarType::ObjectId { object_name },
             ..
@@ -398,7 +407,8 @@ fn recurse_embedded_multi(
 }
 
 fn topo_order(edges: &[BTreeMap<usize, EdgeFields>], n: usize) -> Vec<usize> {
-    let mut deps: Vec<HashSet<usize>> = (0..n).map(|i| edges[i].keys().copied().collect()).collect();
+    let mut deps: Vec<HashSet<usize>> =
+        (0..n).map(|i| edges[i].keys().copied().collect()).collect();
     let mut order: Vec<usize> = Vec::with_capacity(n);
     let mut ready: Vec<usize> = (0..n).filter(|&i| deps[i].is_empty()).collect();
     while let Some(i) = ready.pop() {
@@ -442,7 +452,9 @@ fn break_cycles(
             }
             let mut best: Option<Candidate> = None;
             for &u in &sorted_scc {
-                let Some(targets) = edges.get(u) else { continue };
+                let Some(targets) = edges.get(u) else {
+                    continue;
+                };
                 for (&v, ef) in targets.iter() {
                     if !scc_set.contains(&v) {
                         continue;
@@ -466,10 +478,8 @@ fn break_cycles(
             }
             let chosen = best.map(|c| (c.u, c.v, c.field));
             let Some((u, v, field)) = chosen else {
-                let mut nodes: Vec<String> = scc
-                    .iter()
-                    .map(|&i| display_shard(&shards[i].key))
-                    .collect();
+                let mut nodes: Vec<String> =
+                    scc.iter().map(|&i| display_shard(&shards[i].key)).collect();
                 nodes.sort();
                 let mut immutable_hint: Option<String> = None;
                 'find_imm: for &u in &scc {
@@ -491,9 +501,8 @@ fn break_cycles(
                         }
                     }
                 }
-                let mut msg = String::from(
-                    "cannot snapshot: cyclic dependency between selected types: ",
-                );
+                let mut msg =
+                    String::from("cannot snapshot: cyclic dependency between selected types: ");
                 msg.push_str(&nodes.join(", "));
                 if let Some(h) = immutable_hint {
                     msg.push_str(" (immutable field closes the cycle: ");
@@ -1007,12 +1016,7 @@ impl FetchCache {
         }
     }
 
-    fn ensure(
-        &mut self,
-        cx: &Ctx<'_>,
-        canonical: &str,
-        reporter: &mut Reporter,
-    ) -> CliResult<()> {
+    fn ensure(&mut self, cx: &Ctx<'_>, canonical: &str, reporter: &mut Reporter) -> CliResult<()> {
         if self.by_canonical.contains_key(canonical) {
             return Ok(());
         }
@@ -1108,7 +1112,9 @@ fn fetch_all_partitioned(
 
 fn partition_into(list: &[Value], groups: &mut VariantGroups) {
     for item in list {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         let variant = obj.get("@type").and_then(Value::as_str).map(String::from);
         groups.entry(variant).or_default().push(obj.clone());
     }
@@ -1484,11 +1490,7 @@ impl Reporter {
             return;
         }
         let mut err = std::io::stderr().lock();
-        let _ = writeln!(
-            err,
-            "  fetching {}...",
-            resolve::display_name(canonical)
-        );
+        let _ = writeln!(err, "  fetching {}...", resolve::display_name(canonical));
     }
     fn fetch_done(&mut self, count: usize) {
         if self.quiet {
@@ -1852,9 +1854,7 @@ mod tests {
         let allow: HashSet<String> = HashSet::new();
         let cfg = crate::app::config::Config {
             url: "http://localhost".into(),
-            auth: crate::app::config::AuthMode::Bearer {
-                token: "x".into(),
-            },
+            auth: crate::app::config::AuthMode::Bearer { token: "x".into() },
             insecure: false,
             color: false,
             debug: false,
@@ -1875,15 +1875,7 @@ mod tests {
             let mut reporter = Reporter::new(true);
             for shard in plan.iter_non_singletons() {
                 let deferred = plan.deferred_for(&shard.key);
-                emit_upsert(
-                    &mut sink,
-                    &cx,
-                    shard,
-                    &deferred,
-                    &mut cache,
-                    &mut reporter,
-                )
-                .unwrap();
+                emit_upsert(&mut sink, &cx, shard, &deferred, &mut cache, &mut reporter).unwrap();
             }
             emit_deferred_updates(&mut sink, &cx, &plan, &mut cache).unwrap();
         }
@@ -1892,8 +1884,14 @@ mod tests {
         assert_eq!(lines.len(), 3, "expected 3 ndjson lines, got: {output}");
 
         let create_tenant: Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(create_tenant.get("@type"), Some(&Value::String("upsert".into())));
-        assert_eq!(create_tenant.get("object"), Some(&Value::String("Tenant".into())));
+        assert_eq!(
+            create_tenant.get("@type"),
+            Some(&Value::String("upsert".into()))
+        );
+        assert_eq!(
+            create_tenant.get("object"),
+            Some(&Value::String("Tenant".into()))
+        );
         let value = create_tenant
             .get("value")
             .and_then(Value::as_object)
@@ -1905,12 +1903,24 @@ mod tests {
         );
 
         let create_role: Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(create_role.get("@type"), Some(&Value::String("upsert".into())));
-        assert_eq!(create_role.get("object"), Some(&Value::String("Role".into())));
+        assert_eq!(
+            create_role.get("@type"),
+            Some(&Value::String("upsert".into()))
+        );
+        assert_eq!(
+            create_role.get("object"),
+            Some(&Value::String("Role".into()))
+        );
 
         let update_tenant: Value = serde_json::from_str(lines[2]).unwrap();
-        assert_eq!(update_tenant.get("@type"), Some(&Value::String("update".into())));
-        assert_eq!(update_tenant.get("object"), Some(&Value::String("Tenant".into())));
+        assert_eq!(
+            update_tenant.get("@type"),
+            Some(&Value::String("update".into()))
+        );
+        assert_eq!(
+            update_tenant.get("object"),
+            Some(&Value::String("Tenant".into()))
+        );
         let id = update_tenant.get("id").and_then(Value::as_str).unwrap();
         assert!(
             id.starts_with("#tenant-"),
@@ -1971,9 +1981,7 @@ mod tests {
     fn dummy_jmap_http() -> crate::jmap::http::HttpClient {
         let cfg = crate::app::config::Config {
             url: "http://localhost".into(),
-            auth: crate::app::config::AuthMode::Bearer {
-                token: "x".into(),
-            },
+            auth: crate::app::config::AuthMode::Bearer { token: "x".into() },
             insecure: false,
             color: false,
             debug: false,
@@ -2255,7 +2263,11 @@ mod tests {
         assert_eq!(v.get("@type"), Some(&Value::String("upsert".into())));
         assert_eq!(v.get("object"), Some(&Value::String("DnsServer".into())));
         let value = v.get("value").and_then(Value::as_object).unwrap();
-        assert_eq!(value.len(), 1, "expected one client-id entry, got: {value:?}");
+        assert_eq!(
+            value.len(),
+            1,
+            "expected one client-id entry, got: {value:?}"
+        );
         let payload = value.values().next().and_then(Value::as_object).unwrap();
         assert_eq!(
             payload.get("@type"),
@@ -2335,18 +2347,16 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        let s3_fields = singleton_fields_for(&s, "x:BlobStore", &s3_obj)
-            .expect("S3 variant must resolve");
+        let s3_fields =
+            singleton_fields_for(&s, "x:BlobStore", &s3_obj).expect("S3 variant must resolve");
         assert!(
             s3_fields.properties.contains_key("bucket"),
             "S3 fields must contain `bucket`; got: {:?}",
             s3_fields.properties.keys().collect::<Vec<_>>()
         );
 
-        let default_obj: Map<String, Value> = json!({"@type": "Default"})
-            .as_object()
-            .unwrap()
-            .clone();
+        let default_obj: Map<String, Value> =
+            json!({"@type": "Default"}).as_object().unwrap().clone();
         let default_fields = singleton_fields_for(&s, "x:BlobStore", &default_obj)
             .expect("marker-only Default variant must resolve to empty fields");
         assert!(
@@ -2355,10 +2365,8 @@ mod tests {
             default_fields.properties.keys().collect::<Vec<_>>()
         );
 
-        let unknown_obj: Map<String, Value> = json!({"@type": "Nonsense"})
-            .as_object()
-            .unwrap()
-            .clone();
+        let unknown_obj: Map<String, Value> =
+            json!({"@type": "Nonsense"}).as_object().unwrap().clone();
         let err = singleton_fields_for(&s, "x:BlobStore", &unknown_obj)
             .expect_err("unknown variant must be rejected");
         assert!(

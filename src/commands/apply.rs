@@ -641,7 +641,11 @@ fn is_multi_variant(schema: &Schema, canonical: &str) -> bool {
     )
 }
 
-fn fields_for<'a>(schema: &'a Schema, canonical: &str, at_type: Option<&str>) -> Option<&'a Fields> {
+fn fields_for<'a>(
+    schema: &'a Schema,
+    canonical: &str,
+    at_type: Option<&str>,
+) -> Option<&'a Fields> {
     match schema.schemas.get(canonical)? {
         ObjectSchema::Single { schema_name } => schema.fields.get(schema_name),
         ObjectSchema::Multiple { variants } => {
@@ -901,7 +905,9 @@ fn execute_upsert(
         })?;
         match find_match(matcher, &ctx.schema, canonical, body, &key)? {
             Some(server_id) => {
-                state.created_ids.insert(client_id.clone(), server_id.clone());
+                state
+                    .created_ids
+                    .insert(client_id.clone(), server_id.clone());
                 let at_type = body.get("@type").and_then(Value::as_str);
                 let mut patch = body.clone();
                 patch.remove("@type");

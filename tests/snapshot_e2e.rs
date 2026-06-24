@@ -1,12 +1,17 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 mod common;
 
+use common::stalwart;
+use common::stalwart::{ADMIN_PASSWORD as PASS, ADMIN_USER as USER};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-
-use common::stalwart;
-use common::stalwart::{ADMIN_PASSWORD as PASS, ADMIN_USER as USER};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_stalwart-cli")
@@ -220,7 +225,13 @@ fn id_with(object: &str, field: &str, value: &str) -> Option<String> {
 }
 
 fn ids_with(object: &str, field: &str, value: &str) -> Vec<String> {
-    let out = run_args(&["query", object, "--fields", &format!("id,{field}"), "--json"]);
+    let out = run_args(&[
+        "query",
+        object,
+        "--fields",
+        &format!("id,{field}"),
+        "--json",
+    ]);
     if !out.status.success() {
         return Vec::new();
     }
@@ -363,7 +374,10 @@ fn snapshot_domain_is_upsert_only_with_match_on() {
     );
 
     let dry = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan.as_bytes());
-    assert_ok(&dry, "the emitted snapshot must be consumable by apply --dry-run");
+    assert_ok(
+        &dry,
+        "the emitted snapshot must be consumable by apply --dry-run",
+    );
 }
 
 #[test]
@@ -391,7 +405,10 @@ fn upsert_creates_then_updates_idempotently() {
         (0, 0),
         "second upsert must match and not create"
     );
-    assert!(updated2 >= 1, "second upsert must update the matched object");
+    assert!(
+        updated2 >= 1,
+        "second upsert must update the matched object"
+    );
     assert_eq!(
         ids_where("Domain", &format!("name={name}")).len(),
         1,
@@ -419,7 +436,10 @@ fn upsert_updates_domain_referenced_by_non_nullable_singleton() {
         "--field",
         &format!("defaultHostname=mail.{name}"),
     ]);
-    assert_ok(&set_ref, "point SystemSettings.defaultDomainId at the domain");
+    assert_ok(
+        &set_ref,
+        "point SystemSettings.defaultDomainId at the domain",
+    );
 
     let destroy = run_args(&["delete", "Domain", "--ids", &id]);
     assert!(
@@ -921,7 +941,10 @@ fn apply_destroy_op_removes_every_instance() {
         "routes must exist before destroy"
     );
 
-    let out = run_with_stdin(&["apply", "--stdin"], b"{\"@type\":\"destroy\",\"object\":\"MtaRoute\"}\n");
+    let out = run_with_stdin(
+        &["apply", "--stdin"],
+        b"{\"@type\":\"destroy\",\"object\":\"MtaRoute\"}\n",
+    );
     assert_ok(&out, "apply a real destroy op");
     assert!(
         ids_for("MtaRoute").is_empty(),

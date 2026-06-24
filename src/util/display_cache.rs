@@ -21,16 +21,16 @@ impl DisplayCache {
     }
 
     pub fn get(&self, object_name: &str, id: &str) -> Option<&str> {
-        self.by_object
-            .get(object_name)?
-            .get(id)
-            .map(String::as_str)
+        self.by_object.get(object_name)?.get(id).map(String::as_str)
     }
 
     fn filter_uncached(&self, object_name: &str, ids: HashSet<String>) -> Vec<String> {
         match self.by_object.get(object_name) {
             None => ids.into_iter().collect(),
-            Some(cached) => ids.into_iter().filter(|id| !cached.contains_key(id)).collect(),
+            Some(cached) => ids
+                .into_iter()
+                .filter(|id| !cached.contains_key(id))
+                .collect(),
         }
     }
 
