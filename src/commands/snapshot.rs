@@ -921,12 +921,13 @@ fn emit_upsert<W: Write>(
 
     let mut first_entry = true;
     let mut total = 0usize;
+    let mut anon = false;
     for obj in objs {
         let server_id = match obj.get("id").and_then(Value::as_str) {
             Some(s) => s,
             None => continue,
         };
-        let mut out_obj = transform_object(schema, fields, obj, allow, include_secrets);
+        let mut out_obj = transform_object(schema, fields, obj, allow, include_secrets, &mut anon);
         if shard.key.variant.is_some()
             && let Some(at_type) = obj.get("@type")
         {
@@ -934,6 +935,15 @@ fn emit_upsert<W: Write>(
         }
         for k in &omit {
             out_obj.remove(*k);
+        }
+        if let Some(keys) = &match_on {
+            for key in keys {
+                if !out_obj.contains_key(key)
+                    && let Some(v) = obj.get(key)
+                {
+                    out_obj.insert(key.clone(), v.clone());
+                }
+            }
         }
 
         if !first_entry {
@@ -949,6 +959,9 @@ fn emit_upsert<W: Write>(
 
     sink.write_all(b"}}\n")?;
     sink.flush()?;
+    if anon {
+        reporter.anonymized_secret_warning(&shard.key.canonical);
+    }
     reporter.shard_done(&shard.key, total);
     Ok(())
 }
@@ -981,8 +994,15 @@ fn emit_deferred_updates<W: Write>(
                 continue;
             };
             let mut patch = Map::new();
-            let transformed =
-                transform_object(cx.schema, fields, obj, cx.allow, cx.include_secrets);
+            let mut ignore_anon = false;
+            let transformed = transform_object(
+                cx.schema,
+                fields,
+                obj,
+                cx.allow,
+                cx.include_secrets,
+                &mut ignore_anon,
+            );
             for name in &field_names {
                 if let Some(v) = transformed.get(*name) {
                     patch.insert((*name).to_string(), v.clone());
@@ -1193,13 +1213,17 @@ fn emit_singleton_update<W: Write>(
         .as_object()
         .ok_or_else(|| CliError::UnexpectedResponse("singleton result is not an object".into()))?;
     let fields = singleton_fields_for(schema, canonical, obj)?;
-    let transformed = transform_object(schema, fields, obj, allow, include_secrets);
+    let mut anon = false;
+    let transformed = transform_object(schema, fields, obj, allow, include_secrets, &mut anon);
 
     sink.write_all(b"{\"@type\":\"update\",\"object\":\"")?;
     sink.write_all(resolve::display_name(canonical).as_bytes())?;
     sink.write_all(b"\",\"value\":")?;
     serde_json::to_writer(&mut *sink, &Value::Object(transformed))?;
     sink.write_all(b"}\n")?;
+    if anon {
+        reporter.anonymized_secret_warning(canonical);
+    }
     reporter.singleton_done(canonical);
     Ok(())
 }
@@ -1224,6 +1248,7 @@ fn transform_object(
     input: &Map<String, Value>,
     allow: &HashSet<String>,
     include_secrets: bool,
+    anon: &mut bool,
 ) -> Map<String, Value> {
     let mut out = Map::with_capacity(input.len());
     if let Some(at_type) = input.get("@type") {
@@ -1233,11 +1258,17 @@ fn transform_object(
         if matches!(field.update, crate::schema::FieldUpdate::ServerSet) {
             continue;
         }
-        if !include_secrets && field_is_secret_scalar(&field.typ) {
-            continue;
+        if field_is_secret_scalar(&field.typ) {
+            if input.get(name).is_some_and(is_anonymized_secret) {
+                *anon = true;
+            }
+            if !include_secrets {
+                continue;
+            }
         }
         let Some(raw) = input.get(name) else { continue };
-        let transformed = transform_value(schema, &field.typ, raw.clone(), allow, include_secrets);
+        let transformed =
+            transform_value(schema, &field.typ, raw.clone(), allow, include_secrets, anon);
         let Some(v) = transformed else { continue };
         out.insert(name.clone(), v);
     }
@@ -1254,12 +1285,17 @@ fn field_is_secret_scalar(t: &FieldType) -> bool {
     )
 }
 
+fn is_anonymized_secret(v: &Value) -> bool {
+    matches!(v, Value::String(s) if !s.is_empty() && s.bytes().all(|b| b == b'*'))
+}
+
 fn transform_value(
     schema: &Schema,
     t: &FieldType,
     value: Value,
     allow: &HashSet<String>,
     include_secrets: bool,
+    anon: &mut bool,
 ) -> Option<Value> {
     if value.is_null() {
         return Some(value);
@@ -1293,12 +1329,13 @@ fn transform_value(
             value,
             allow,
             include_secrets,
+            anon,
         ),
         FieldType::Object { object_name, .. } => {
-            transform_embedded(schema, object_name, value, allow, include_secrets)
+            transform_embedded(schema, object_name, value, allow, include_secrets, anon)
         }
         FieldType::ObjectList { object_name, .. } => {
-            transform_object_list(schema, object_name, value, allow, include_secrets)
+            transform_object_list(schema, object_name, value, allow, include_secrets, anon)
         }
         _ => Some(value),
     }
@@ -1342,6 +1379,7 @@ fn transform_map(
     value: Value,
     allow: &HashSet<String>,
     include_secrets: bool,
+    anon: &mut bool,
 ) -> Option<Value> {
     let Value::Object(map) = value else {
         return Some(value);
@@ -1371,7 +1409,7 @@ fn transform_map(
         };
         let new_value = match value_class {
             MapValueType::Object { object_name } => {
-                match transform_embedded(schema, object_name, v, allow, include_secrets) {
+                match transform_embedded(schema, object_name, v, allow, include_secrets, anon) {
                     Some(tv) => tv,
                     None => continue,
                 }
@@ -1389,6 +1427,7 @@ fn transform_embedded(
     value: Value,
     allow: &HashSet<String>,
     include_secrets: bool,
+    anon: &mut bool,
 ) -> Option<Value> {
     let Value::Object(map) = value else {
         return Some(value);
@@ -1417,11 +1456,17 @@ fn transform_embedded(
         if matches!(field.update, crate::schema::FieldUpdate::ServerSet) {
             continue;
         }
-        if !include_secrets && field_is_secret_scalar(&field.typ) {
-            continue;
+        if field_is_secret_scalar(&field.typ) {
+            if map.get(name).is_some_and(is_anonymized_secret) {
+                *anon = true;
+            }
+            if !include_secrets {
+                continue;
+            }
         }
         let Some(raw) = map.get(name) else { continue };
-        if let Some(v) = transform_value(schema, &field.typ, raw.clone(), allow, include_secrets) {
+        if let Some(v) = transform_value(schema, &field.typ, raw.clone(), allow, include_secrets, anon)
+        {
             out.insert(name.clone(), v);
         }
     }
@@ -1434,13 +1479,15 @@ fn transform_object_list(
     value: Value,
     allow: &HashSet<String>,
     include_secrets: bool,
+    anon: &mut bool,
 ) -> Option<Value> {
     let Value::Object(map) = value else {
         return Some(value);
     };
     let mut out = Map::with_capacity(map.len());
     for (idx, item) in map {
-        if let Some(tv) = transform_embedded(schema, object_name, item, allow, include_secrets) {
+        if let Some(tv) = transform_embedded(schema, object_name, item, allow, include_secrets, anon)
+        {
             out.insert(idx, tv);
         }
     }
@@ -1482,6 +1529,18 @@ impl Reporter {
             "  warning: {} has no label property; objects will be matched by value on apply \
              (a changed object will be created as a new one). Add a `matchOn` to the plan to \
              match on a specific key.",
+            resolve::display_name(canonical)
+        );
+    }
+    fn anonymized_secret_warning(&mut self, canonical: &str) {
+        if self.quiet || !self.warned.insert(format!("secret:{canonical}")) {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(
+            err,
+            "  warning: {} has secret field(s) the server returns anonymized (****); \
+             their values cannot be captured and must be supplied in the plan before applying.",
             resolve::display_name(canonical)
         );
     }
@@ -2045,6 +2104,127 @@ mod tests {
     }
 
     #[test]
+    fn detects_anonymized_secret_values() {
+        assert!(is_anonymized_secret(&json!("****")));
+        assert!(is_anonymized_secret(&json!("*")));
+        assert!(!is_anonymized_secret(&json!("")));
+        assert!(!is_anonymized_secret(&json!("a*b")));
+        assert!(!is_anonymized_secret(&json!("real-secret")));
+        assert!(!is_anonymized_secret(&json!(null)));
+        assert!(!is_anonymized_secret(&json!(42)));
+    }
+
+    #[test]
+    fn transform_object_flags_anonymized_secret_and_strips_it() {
+        use crate::schema::Field;
+        let secret_field = Field {
+            description: String::new(),
+            typ: FieldType::String {
+                format: StringFormat::Secret,
+                min_length: None,
+                max_length: None,
+                nullable: false,
+            },
+            update: FieldUpdate::Mutable,
+            enterprise: false,
+        };
+        let fields = fields_with(vec![("pw", secret_field)]);
+        let mut obj = Map::new();
+        obj.insert("pw".into(), Value::String("****".into()));
+        let allow: HashSet<String> = HashSet::new();
+        let mut anon = false;
+        let out = transform_object(&Schema::default(), &fields, &obj, &allow, false, &mut anon);
+        assert!(anon, "an anonymized secret value must raise the flag");
+        assert!(
+            !out.contains_key("pw"),
+            "a secret scalar must still be stripped by default"
+        );
+    }
+
+    #[test]
+    fn emit_upsert_keeps_server_set_match_key_in_body() {
+        use crate::schema::{Field, List};
+        let string_field = |update: FieldUpdate| Field {
+            description: String::new(),
+            typ: FieldType::String {
+                format: StringFormat::String,
+                min_length: None,
+                max_length: None,
+                nullable: false,
+            },
+            update,
+            enterprise: false,
+        };
+        let mut s = Schema::default();
+        s.objects.insert("x:Cert".into(), obj_type());
+        s.schemas.insert("x:Cert".into(), single_obj("x:Cert"));
+        s.fields.insert(
+            "x:Cert".into(),
+            fields_with(vec![
+                ("san", string_field(FieldUpdate::ServerSet)),
+                ("blob", string_field(FieldUpdate::Mutable)),
+            ]),
+        );
+        s.lists.insert(
+            "x:Cert".into(),
+            List {
+                title: String::new(),
+                subtitle: String::new(),
+                label_property: Some("san".into()),
+                singular_name: String::new(),
+                plural_name: String::new(),
+                columns: vec![],
+                filters: vec![],
+                filters_static: HashMap::new(),
+                sort: vec![],
+                mass_actions: vec![],
+                item_actions: vec![],
+            },
+        );
+
+        let shard = Shard {
+            key: ShardKey {
+                canonical: "x:Cert".into(),
+                variant: None,
+            },
+            is_singleton: false,
+        };
+        let mut groups: VariantGroups = HashMap::new();
+        let mut obj = Map::new();
+        obj.insert("id".into(), Value::String("c1".into()));
+        obj.insert("san".into(), Value::String("example.com".into()));
+        obj.insert("blob".into(), Value::String("pem".into()));
+        groups.entry(None).or_default().push(obj);
+        let mut cache = FetchCache::new();
+        cache.by_canonical.insert("x:Cert".into(), groups);
+
+        let allow: HashSet<String> = HashSet::new();
+        let http = dummy_jmap_http();
+        let jmap = Jmap::new(&http, "/");
+        let cx = snapshot_ctx(&s, &allow, &jmap);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut reporter = Reporter::new(true);
+        emit_upsert(&mut buf, &cx, &shard, &[], &mut cache, &mut reporter).unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| !l.is_empty()).unwrap();
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v.get("matchOn"), Some(&json!(["san"])));
+        let entry = v["value"].as_object().unwrap().values().next().unwrap();
+        assert_eq!(
+            entry.get("san"),
+            Some(&Value::String("example.com".into())),
+            "the server-set match key must be kept in the body even though serverSet fields are normally stripped: {line}"
+        );
+        assert_eq!(
+            entry.get("blob"),
+            Some(&Value::String("pem".into())),
+            "mutable fields must still be present"
+        );
+    }
+
+    #[test]
     fn emit_create_flushes_sink_around_reporter_calls() {
         let s = tenant_role_schema(true, true);
         let shard = Shard {
@@ -2184,12 +2364,13 @@ mod tests {
 
         let manual = json!({"@type": "Manual"});
         let allow: HashSet<String> = HashSet::new();
-        let out = transform_embedded(&s, "x:DkimManagement", manual, &allow, false)
+        let mut anon = false;
+        let out = transform_embedded(&s, "x:DkimManagement", manual, &allow, false, &mut anon)
             .expect("manual variant must round-trip");
         assert_eq!(out, json!({"@type": "Manual"}));
 
         let auto = json!({"@type": "Automatic", "selectorTemplate": "v{version}"});
-        let out = transform_embedded(&s, "x:DkimManagement", auto, &allow, false)
+        let out = transform_embedded(&s, "x:DkimManagement", auto, &allow, false, &mut anon)
             .expect("automatic variant must round-trip");
         assert_eq!(
             out,

@@ -978,3 +978,184 @@ fn apply_continue_on_error_attempts_all_and_counts_failures() {
         "--continue-on-error must attempt both ops and count both failures"
     );
 }
+
+fn self_signed_pem() -> (String, String) {
+    let ck = rcgen::generate_simple_self_signed(vec!["itest-cert.example.com".to_string()])
+        .expect("generate self-signed certificate");
+    (ck.cert.pem(), ck.signing_key.serialize_pem())
+}
+
+struct PurgeAll(&'static str);
+
+impl Drop for PurgeAll {
+    fn drop(&mut self) {
+        for id in ids_for(self.0) {
+            let _ = run_args(&["delete", self.0, "--ids", &id]);
+        }
+    }
+}
+
+#[test]
+fn upsert_certificate_matches_on_server_set_label() {
+    require_server!();
+    let _serial = serial();
+    let _purge = PurgeAll("Certificate");
+
+    let (cert_pem, key_pem) = self_signed_pem();
+    let create_out = run_args(&[
+        "create",
+        "Certificate",
+        "--json",
+        &json!({
+            "certificate": {"@type": "Text", "value": cert_pem},
+            "privateKey": {"@type": "Text", "secret": key_pem},
+        })
+        .to_string(),
+    ]);
+    assert_ok(&create_out, "create Certificate");
+    let cert_id = stdout_string(&create_out)
+        .split_whitespace()
+        .last()
+        .expect("created id")
+        .trim_end_matches(['\n', '\r'])
+        .to_string();
+
+    let sans = get_json("Certificate", Some(&cert_id))
+        .get("subjectAlternativeNames")
+        .cloned()
+        .expect("the server derives subjectAlternativeNames");
+
+    let plan = json!({
+        "@type": "upsert",
+        "object": "Certificate",
+        "matchOn": ["subjectAlternativeNames"],
+        "value": {
+            "c1": {
+                "certificate": {"@type": "Text", "value": cert_pem},
+                "privateKey": {"@type": "Text", "secret": key_pem},
+                "subjectAlternativeNames": sans,
+            }
+        }
+    })
+    .to_string()
+        + "\n";
+
+    let (c1, u1, f1) = apply_done(plan.as_bytes());
+    assert_eq!(
+        (c1, f1),
+        (0, 0),
+        "the plan must match the existing cert on its server-set SANs, not fail or duplicate"
+    );
+    assert!(u1 >= 1, "the matched certificate must update");
+    let (c2, _u2, f2) = apply_done(plan.as_bytes());
+    assert_eq!((c2, f2), (0, 0), "the certificate plan must be idempotent");
+    assert_eq!(
+        ids_for("Certificate").len(),
+        1,
+        "no duplicate certificate must be created"
+    );
+
+    let count_before = ids_for("Certificate").len();
+    assert_ok(
+        &run_args(&["delete", "Certificate", "--ids", &cert_id]),
+        "delete the certificate",
+    );
+    let (c3, _u3, f3) = apply_done(plan.as_bytes());
+    assert_eq!(f3, 0, "create path must strip the server-set SAN and succeed");
+    assert!(c3 >= 1, "the missing certificate must be created");
+    assert_eq!(
+        ids_for("Certificate").len(),
+        count_before,
+        "the certificate count must return to its prior value"
+    );
+}
+
+#[test]
+fn snapshot_warns_on_anonymized_secret() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let domain = create_domain(&format!("dkimsec-{suffix}.test"));
+    let _tree = DomainTree(domain.clone());
+    if poll_dkim_selector(&domain).is_none() {
+        eprintln!("skipping: no auto DKIM signature appeared");
+        return;
+    }
+
+    let out = snapshot_output("DkimSignature");
+    assert_ok(&out, "snapshot DkimSignature");
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("anonymized") && err.contains("****"),
+        "snapshotting an object with a server-anonymized secret must warn: {err}"
+    );
+}
+
+#[test]
+fn snapshot_certificate_env_var_variant_round_trips() {
+    require_server!();
+    let _serial = serial();
+    let _purge = PurgeAll("Certificate");
+
+    let payload = json!({
+        "certificate": {"@type": "EnvironmentVariable", "variableName": stalwart::CERT_ENV_VAR},
+        "privateKey": {"@type": "EnvironmentVariable", "variableName": stalwart::KEY_ENV_VAR},
+    })
+    .to_string();
+    assert_ok(
+        &run_args(&["create", "Certificate", "--json", &payload]),
+        "create env-var Certificate",
+    );
+
+    let snap = snapshot_output("Certificate");
+    assert_ok(&snap, "snapshot Certificate");
+    assert!(
+        !stderr_string(&snap).contains("anonymized"),
+        "env-var key material is not a secret, so snapshot must not warn: {}",
+        stderr_string(&snap)
+    );
+
+    let plan = stdout_string(&snap);
+    let op = plan
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("snapshot line is NDJSON"))
+        .find(|v| v["object"].as_str() == Some("Certificate"))
+        .expect("a Certificate op");
+    assert_eq!(op.get("matchOn"), Some(&json!(["subjectAlternativeNames"])));
+    let entry = op["value"]
+        .as_object()
+        .and_then(|m| m.values().next())
+        .expect("a value entry");
+    assert_eq!(
+        entry["subjectAlternativeNames"].get(stalwart::CERT_SAN),
+        Some(&json!(true)),
+        "the server-derived SAN must be captured in the body: {entry}"
+    );
+    assert_eq!(
+        entry["privateKey"]["@type"].as_str(),
+        Some("EnvironmentVariable"),
+        "the non-secret key reference must be preserved"
+    );
+
+    let (c1, _u1, f1) = apply_done(plan.as_bytes());
+    assert_eq!((c1, f1), (0, 0), "re-applying must match the existing certificate");
+    let (c2, _u2, f2) = apply_done(plan.as_bytes());
+    assert_eq!((c2, f2), (0, 0), "the snapshot must be idempotent");
+
+    let count = ids_for("Certificate").len();
+    for id in ids_for("Certificate") {
+        assert_ok(
+            &run_args(&["delete", "Certificate", "--ids", &id]),
+            "delete certificate",
+        );
+    }
+    let (c3, _u3, f3) = apply_done(plan.as_bytes());
+    assert_eq!(f3, 0, "restore must not fail (SAN stripped on create, re-derived)");
+    assert!(c3 >= 1, "the deleted certificate must be recreated from the snapshot");
+    assert_eq!(
+        ids_for("Certificate").len(),
+        count,
+        "restore must bring the certificate count back"
+    );
+}

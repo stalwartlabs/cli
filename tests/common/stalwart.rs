@@ -27,6 +27,16 @@ const CONFIG_JSON: &str = r#"{"@type":"RocksDb","blobSize":16834,"bufferSize":13
 pub const ADMIN_USER: &str = "admin";
 pub const ADMIN_PASSWORD: &str = "admin";
 
+pub const CERT_ENV_VAR: &str = "ITEST_CERT_PEM";
+pub const KEY_ENV_VAR: &str = "ITEST_KEY_PEM";
+pub const CERT_SAN: &str = "itest-cert.example.com";
+
+fn self_signed_pem() -> (String, String) {
+    let ck = rcgen::generate_simple_self_signed(vec![CERT_SAN.to_string()])
+        .expect("generate self-signed certificate");
+    (ck.cert.pem(), ck.signing_key.serialize_pem())
+}
+
 #[allow(dead_code)]
 pub struct Stalwart {
     _container: Container<GenericImage>,
@@ -45,9 +55,12 @@ impl Stalwart {
             .with_exposed_port(HTTPS_PORT.tcp())
             .with_wait_for(WaitFor::seconds(2));
 
+        let (cert_pem, key_pem) = self_signed_pem();
         let request = image
             .with_env_var("STALWART_PUBLIC_URL", &base_url)
             .with_env_var("STALWART_RECOVERY_ADMIN", "admin:admin")
+            .with_env_var(CERT_ENV_VAR, cert_pem)
+            .with_env_var(KEY_ENV_VAR, key_pem)
             .with_copy_to(CONFIG_PATH, CONFIG_JSON.as_bytes().to_vec())
             .with_mapped_port(https_port, HTTPS_PORT.tcp())
             .with_startup_timeout(Duration::from_secs(180));

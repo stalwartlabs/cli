@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.10] - 2026-06-25
+
+### Added
+
+### Changed
+
+### Fixed
+- `upsert` removed required `matchOn` field.
+
 ## [1.0.9] - 2026-06-24
 
 ### Added

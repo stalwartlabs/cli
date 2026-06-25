@@ -931,7 +931,18 @@ fn execute_upsert(
                 }
             }
             None => {
-                to_create.insert(client_id.clone(), body_val.clone());
+                let at_type = body.get("@type").and_then(Value::as_str);
+                let mut create_body = body.clone();
+                if let Some(fields) = fields_for(&ctx.schema, canonical, at_type) {
+                    create_body.retain(|k, _| {
+                        fields
+                            .properties
+                            .get(k)
+                            .map(|f| !matches!(f.update, crate::schema::FieldUpdate::ServerSet))
+                            .unwrap_or(true)
+                    });
+                }
+                to_create.insert(client_id.clone(), Value::Object(create_body));
             }
         }
     }
