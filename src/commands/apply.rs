@@ -24,6 +24,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
     let raw_ops = parse_ndjson_plan(&input)?;
 
     let plan = Plan::resolve(&ctx.schema, raw_ops)?;
+    validate_plan_references(&ctx.schema, &plan)?;
 
     let ansi = Ansi::new(ctx.config.color);
     let reporter = Reporter::new(args, ansi);
@@ -40,6 +41,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
         summary: Summary::new(&plan),
     };
     let mut matcher = Matcher::new();
+    let mut reconcile_leaks: Vec<(String, usize, Vec<String>)> = Vec::new();
 
     for op in plan.ops.iter().rev() {
         if let ResolvedOp::Destroy {
@@ -101,6 +103,39 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
                     }
                 }
             }
+            ResolvedOp::Reconcile {
+                canonical,
+                match_on,
+                value,
+                index,
+            } => {
+                match execute_reconcile(
+                    ctx,
+                    &jmap,
+                    canonical,
+                    match_on.as_deref(),
+                    value,
+                    &mut state,
+                    &mut matcher,
+                    *index,
+                    &reporter,
+                ) {
+                    Ok((created, updated, leaked)) => {
+                        state.summary.created += created;
+                        state.summary.updated += updated;
+                        reporter.op_ok(*index, "reconcile", canonical, created + updated);
+                        reconcile_leaks.push((canonical.clone(), *index, leaked));
+                    }
+                    Err(e) => {
+                        state.summary.failed += 1;
+                        reporter.op_err(*index, "reconcile", canonical, &e);
+                        if !args.continue_on_error {
+                            reporter.final_summary(&state.summary);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
             ResolvedOp::Update {
                 canonical,
                 id,
@@ -147,6 +182,27 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
                             return Err(e);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    let batch_size = ctx.session.max_objects_in_set.max(1);
+    for (canonical, index, ids) in reconcile_leaks.iter().rev() {
+        if ids.is_empty() {
+            continue;
+        }
+        match destroy_ids(&jmap, canonical, ids, batch_size, &reporter) {
+            Ok(count) => {
+                state.summary.destroyed += count;
+                reporter.reconcile_cleanup(*index, canonical, count);
+            }
+            Err(e) => {
+                state.summary.failed += 1;
+                reporter.op_err(*index, "reconcile", canonical, &e);
+                if !args.continue_on_error {
+                    reporter.final_summary(&state.summary);
+                    return Err(e);
                 }
             }
         }
@@ -224,6 +280,13 @@ enum RawOp {
         #[serde(default)]
         value: Map<String, Value>,
     },
+    Reconcile {
+        object: String,
+        #[serde(default, rename = "matchOn")]
+        match_on: Option<Vec<String>>,
+        #[serde(default)]
+        value: Map<String, Value>,
+    },
 }
 
 enum ResolvedOp {
@@ -249,6 +312,12 @@ enum ResolvedOp {
         value: Map<String, Value>,
         index: usize,
     },
+    Reconcile {
+        canonical: String,
+        match_on: Option<Vec<String>>,
+        value: Map<String, Value>,
+        index: usize,
+    },
 }
 
 struct Plan {
@@ -259,6 +328,8 @@ struct Plan {
     create_objects: usize,
     upserts: usize,
     upsert_objects: usize,
+    reconciles: usize,
+    reconcile_objects: usize,
 }
 
 impl Plan {
@@ -270,6 +341,8 @@ impl Plan {
         let mut create_objects = 0usize;
         let mut upserts = 0usize;
         let mut upsert_objects = 0usize;
+        let mut reconciles = 0usize;
+        let mut reconcile_objects = 0usize;
 
         for (index, r) in raw.into_iter().enumerate() {
             match r {
@@ -392,6 +465,64 @@ impl Plan {
                         index,
                     });
                 }
+                RawOp::Reconcile {
+                    object,
+                    match_on,
+                    value,
+                } => {
+                    let canonical = resolve::require_object(schema, &object)?;
+                    if matches!(
+                        schema.objects.get(canonical),
+                        Some(ObjectType::Singleton { .. })
+                    ) {
+                        return Err(CliError::msg(format!(
+                            "cannot reconcile singleton `{}` (operation #{}); use update instead",
+                            resolve::display_name(canonical),
+                            index + 1,
+                        )));
+                    }
+                    if let Some(keys) = &match_on
+                        && keys.is_empty()
+                    {
+                        return Err(CliError::msg(format!(
+                            "reconcile operation #{} has an empty `matchOn` list",
+                            index + 1,
+                        )));
+                    }
+                    if matches!(
+                        resolve_match_key(schema, canonical, match_on.as_deref()),
+                        MatchKey::Value
+                    ) {
+                        return Err(CliError::msg(format!(
+                            "reconcile operation #{} on `{}` has no match key; add a `matchOn` \
+                             (reconcile refuses to value-match, since a drifted object would be \
+                             deleted and recreated)",
+                            index + 1,
+                            resolve::display_name(canonical),
+                        )));
+                    }
+
+                    let mut normalised = Map::new();
+                    for (k, v) in value {
+                        let key = k.strip_prefix('#').map(String::from).unwrap_or(k);
+                        if normalised.contains_key(&key) {
+                            return Err(CliError::msg(format!(
+                                "reconcile operation #{} has duplicate id `{}`",
+                                index + 1,
+                                key
+                            )));
+                        }
+                        normalised.insert(key, v);
+                    }
+                    reconciles += 1;
+                    reconcile_objects += normalised.len();
+                    ops.push(ResolvedOp::Reconcile {
+                        canonical: canonical.to_string(),
+                        match_on,
+                        value: normalised,
+                        index,
+                    });
+                }
             }
         }
 
@@ -403,6 +534,8 @@ impl Plan {
             create_objects,
             upserts,
             upsert_objects,
+            reconciles,
+            reconcile_objects,
         })
     }
 }
@@ -444,6 +577,8 @@ struct Summary {
     planned_create_objects: usize,
     planned_upserts: usize,
     planned_upsert_objects: usize,
+    planned_reconciles: usize,
+    planned_reconcile_objects: usize,
     destroyed: usize,
     updated: usize,
     created: usize,
@@ -459,6 +594,8 @@ impl Summary {
             planned_create_objects: plan.create_objects,
             planned_upserts: plan.upserts,
             planned_upsert_objects: plan.upsert_objects,
+            planned_reconciles: plan.reconciles,
+            planned_reconcile_objects: plan.reconcile_objects,
             destroyed: 0,
             updated: 0,
             created: 0,
@@ -520,11 +657,21 @@ fn execute_destroy(
     reporter: &Reporter,
 ) -> CliResult<usize> {
     let ids = fetch_all_ids(ctx, jmap, canonical, filter)?;
+    let batch_size = ctx.session.max_objects_in_set.max(1);
+    destroy_ids(jmap, canonical, &ids, batch_size, reporter)
+}
+
+fn destroy_ids(
+    jmap: &Jmap,
+    canonical: &str,
+    ids: &[String],
+    batch_size: usize,
+    reporter: &Reporter,
+) -> CliResult<usize> {
     if ids.is_empty() {
         return Ok(0);
     }
 
-    let batch_size = ctx.session.max_objects_in_set.max(1);
     let method = format!("{canonical}/set");
     let mut destroyed = 0usize;
     let batches = ids.len().div_ceil(batch_size);
@@ -796,6 +943,7 @@ fn find_match(
     canonical: &str,
     body: &Map<String, Value>,
     key: &MatchKey,
+    created_ids: &HashMap<String, String>,
 ) -> CliResult<Option<String>> {
     let multi = is_multi_variant(schema, canonical);
     let at_type = body.get("@type").and_then(Value::as_str);
@@ -816,19 +964,23 @@ fn find_match(
 
     match key {
         MatchKey::Props(props) => {
+            let fields = fields_for(schema, canonical, at_type);
+            let mut wanted: Vec<(&str, Value)> = Vec::with_capacity(props.len());
             for p in props {
-                if !body.contains_key(p) {
+                let Some(raw) = body.get(p) else {
                     return Err(CliError::msg(format!(
                         "{}: match property `{}` is missing from the object body",
                         resolve::display_name(canonical),
                         p,
                     )));
-                }
+                };
+                let resolved = resolve_match_value(canonical, fields, p, raw, created_ids)?;
+                wanted.push((p.as_str(), resolved));
             }
             let mut matched: Option<String> = None;
             let mut count = 0usize;
             for cand in candidates {
-                if props.iter().all(|p| cand.get(p) == body.get(p)) {
+                if wanted.iter().all(|(p, r)| cand.get(*p) == Some(r)) {
                     count += 1;
                     if matched.is_none() {
                         matched = cand.get("id").and_then(Value::as_str).map(String::from);
@@ -875,8 +1027,93 @@ fn find_match(
     }
 }
 
+fn validate_plan_references(schema: &Schema, plan: &Plan) -> CliResult<()> {
+    let mut declared: HashMap<String, String> = HashMap::new();
+    for op in &plan.ops {
+        let value = match op {
+            ResolvedOp::Create { value, .. }
+            | ResolvedOp::Upsert { value, .. }
+            | ResolvedOp::Reconcile { value, .. } => value,
+            _ => continue,
+        };
+        for k in value.keys() {
+            declared.insert(k.clone(), k.clone());
+        }
+
+        let (canonical, match_on) = match op {
+            ResolvedOp::Upsert {
+                canonical,
+                match_on,
+                ..
+            }
+            | ResolvedOp::Reconcile {
+                canonical,
+                match_on,
+                ..
+            } => (canonical, match_on),
+            _ => continue,
+        };
+        let key = resolve_match_key(schema, canonical, match_on.as_deref());
+        let MatchKey::Props(props) = &key else {
+            continue;
+        };
+        for body_val in value.values() {
+            let Some(body) = body_val.as_object() else {
+                continue;
+            };
+            let at_type = body.get("@type").and_then(Value::as_str);
+            let fields = fields_for(schema, canonical, at_type);
+            for p in props {
+                if let Some(raw) = body.get(p) {
+                    resolve_match_value(canonical, fields, p, raw, &declared)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_match_value(
+    canonical: &str,
+    fields: Option<&Fields>,
+    prop: &str,
+    raw: &Value,
+    created_ids: &HashMap<String, String>,
+) -> CliResult<Value> {
+    let is_ref = fields
+        .and_then(|f| f.properties.get(prop))
+        .is_some_and(|f| matches!(f.typ, FieldType::ObjectId { .. }));
+    if !is_ref {
+        return Ok(raw.clone());
+    }
+    let Some(client_id) = raw
+        .as_str()
+        .and_then(|s| s.strip_prefix('#'))
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(raw.clone());
+    };
+    match created_ids.get(client_id) {
+        Some(server_id) => Ok(Value::String(server_id.clone())),
+        None => Err(CliError::msg(format!(
+            "{}: match property `{}` references unresolved id `#{}` \
+             (no create, upsert, or reconcile operation in this plan produced it)",
+            resolve::display_name(canonical),
+            prop,
+            client_id,
+        ))),
+    }
+}
+
+struct UpsertOutcome {
+    created: usize,
+    updated: usize,
+    matched_ids: HashSet<String>,
+    plan_at_types: HashSet<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn execute_upsert(
+fn upsert_core(
     ctx: &Context,
     jmap: &Jmap,
     canonical: &str,
@@ -886,7 +1123,7 @@ fn execute_upsert(
     matcher: &mut Matcher,
     op_index: usize,
     reporter: &Reporter,
-) -> CliResult<(usize, usize)> {
+) -> CliResult<UpsertOutcome> {
     matcher.ensure(ctx, jmap, canonical)?;
     let key = resolve_match_key(&ctx.schema, canonical, match_on);
     if matches!(key, MatchKey::Value) && matcher.warned_value_match.insert(canonical.to_string()) {
@@ -895,6 +1132,8 @@ fn execute_upsert(
 
     let mut to_create: Map<String, Value> = Map::new();
     let mut to_update: Vec<(String, Value)> = Vec::new();
+    let mut matched_ids: HashSet<String> = HashSet::new();
+    let mut plan_at_types: HashSet<String> = HashSet::new();
     for (client_id, body_val) in value {
         let body = body_val.as_object().ok_or_else(|| {
             CliError::msg(format!(
@@ -903,8 +1142,19 @@ fn execute_upsert(
                 client_id,
             ))
         })?;
-        match find_match(matcher, &ctx.schema, canonical, body, &key)? {
+        if let Some(at) = body.get("@type").and_then(Value::as_str) {
+            plan_at_types.insert(at.to_string());
+        }
+        match find_match(
+            matcher,
+            &ctx.schema,
+            canonical,
+            body,
+            &key,
+            &state.created_ids,
+        )? {
             Some(server_id) => {
+                matched_ids.insert(server_id.clone());
                 state
                     .created_ids
                     .insert(client_id.clone(), server_id.clone());
@@ -966,7 +1216,75 @@ fn execute_upsert(
         updated += execute_update(jmap, canonical, server_id, body, &mut state.created_ids)?;
     }
 
-    Ok((created, updated))
+    Ok(UpsertOutcome {
+        created,
+        updated,
+        matched_ids,
+        plan_at_types,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_upsert(
+    ctx: &Context,
+    jmap: &Jmap,
+    canonical: &str,
+    match_on: Option<&[String]>,
+    value: &Map<String, Value>,
+    state: &mut State,
+    matcher: &mut Matcher,
+    op_index: usize,
+    reporter: &Reporter,
+) -> CliResult<(usize, usize)> {
+    let outcome = upsert_core(
+        ctx, jmap, canonical, match_on, value, state, matcher, op_index, reporter,
+    )?;
+    Ok((outcome.created, outcome.updated))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_reconcile(
+    ctx: &Context,
+    jmap: &Jmap,
+    canonical: &str,
+    match_on: Option<&[String]>,
+    value: &Map<String, Value>,
+    state: &mut State,
+    matcher: &mut Matcher,
+    op_index: usize,
+    reporter: &Reporter,
+) -> CliResult<(usize, usize, Vec<String>)> {
+    let outcome = upsert_core(
+        ctx, jmap, canonical, match_on, value, state, matcher, op_index, reporter,
+    )?;
+    let leaked = leaked_ids(&ctx.schema, canonical, matcher, &outcome);
+    Ok((outcome.created, outcome.updated, leaked))
+}
+
+fn leaked_ids(
+    schema: &Schema,
+    canonical: &str,
+    matcher: &Matcher,
+    outcome: &UpsertOutcome,
+) -> Vec<String> {
+    let multi = is_multi_variant(schema, canonical);
+    let mut leaked = Vec::new();
+    for cand in matcher.objects_for(canonical) {
+        let Some(id) = cand.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if outcome.matched_ids.contains(id) {
+            continue;
+        }
+        if multi {
+            match cand.get("@type").and_then(Value::as_str) {
+                Some(t) if outcome.plan_at_types.contains(t) => {}
+                _ => continue,
+            }
+        }
+        leaked.push(id.to_string());
+    }
+    leaked
 }
 
 fn execute_update(
@@ -1165,14 +1483,15 @@ impl Reporter {
         let mut err = std::io::stderr().lock();
         let _ = writeln!(
             err,
-            "{}Plan:{} {} destroy, {} update, {} create, {} upsert ({} objects)",
+            "{}Plan:{} {} destroy, {} update, {} create, {} upsert, {} reconcile ({} objects)",
             self.ansi.bold(),
             self.ansi.reset(),
             plan.destroys,
             plan.updates,
             plan.creates,
             plan.upserts,
-            plan.create_objects + plan.upsert_objects,
+            plan.reconciles,
+            plan.create_objects + plan.upsert_objects + plan.reconcile_objects,
         );
     }
 
@@ -1236,6 +1555,35 @@ impl Reporter {
         );
     }
 
+    fn reconcile_cleanup(&self, index: usize, canonical: &str, count: usize) {
+        let disp = resolve::display_name(canonical);
+        if self.json {
+            let line = json!({
+                "op": "reconcile",
+                "stage": "cleanup",
+                "object": disp,
+                "index": index,
+                "destroyed": count,
+                "status": "ok",
+            });
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{}", line);
+            return;
+        }
+        if self.quiet || count == 0 {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(
+            err,
+            "{}✓{} reconcile removed {} ({})",
+            self.ansi.green(),
+            self.ansi.reset(),
+            disp,
+            count
+        );
+    }
+
     fn op_err(&self, index: usize, kind: &str, canonical: &str, err: &CliError) {
         let disp = resolve::display_name(canonical);
         if self.json {
@@ -1272,6 +1620,8 @@ impl Reporter {
                     "create_objects": s.planned_create_objects,
                     "upserts": s.planned_upserts,
                     "upsert_objects": s.planned_upsert_objects,
+                    "reconciles": s.planned_reconciles,
+                    "reconcile_objects": s.planned_reconcile_objects,
                 },
                 "done": {
                     "destroyed": s.destroyed,
@@ -1304,6 +1654,7 @@ fn past_tense(kind: &str) -> &'static str {
         "update" => "updated",
         "create" => "created",
         "upsert" => "upserted",
+        "reconcile" => "reconciled",
         _ => "done",
     }
 }
@@ -1467,14 +1818,53 @@ mod tests {
     }
 
     fn matcher_with(objs: Vec<Value>) -> Matcher {
+        matcher_for("x:Domain", objs)
+    }
+
+    fn matcher_for(canonical: &str, objs: Vec<Value>) -> Matcher {
         let mut m = Matcher::new();
         m.objects.insert(
-            "x:Domain".into(),
+            canonical.into(),
             objs.into_iter()
                 .filter_map(|v| v.as_object().cloned())
                 .collect(),
         );
         m
+    }
+
+    fn object_id_field(object_name: &str) -> Field {
+        Field {
+            description: String::new(),
+            typ: FieldType::ObjectId {
+                object_name: object_name.into(),
+                nullable: false,
+            },
+            update: crate::schema::FieldUpdate::Mutable,
+            enterprise: false,
+        }
+    }
+
+    fn account_schema() -> Schema {
+        use crate::schema::Fields;
+        let mut s = Schema::default();
+        s.objects.insert("x:Account".into(), obj_type());
+        s.schemas.insert(
+            "x:Account".into(),
+            ObjectSchema::Single {
+                schema_name: "x:Account".into(),
+            },
+        );
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), string_field());
+        props.insert("domainId".to_string(), object_id_field("x:Domain"));
+        s.fields.insert(
+            "x:Account".into(),
+            Fields {
+                properties: props,
+                defaults: HashMap::new(),
+            },
+        );
+        s
     }
 
     #[test]
@@ -1525,11 +1915,11 @@ mod tests {
         ]);
         let body = json!({ "name": "b.com" }).as_object().unwrap().clone();
         let key = resolve_match_key(&s, "x:Domain", None);
-        let got = find_match(&m, &s, "x:Domain", &body, &key).unwrap();
+        let got = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap();
         assert_eq!(got.as_deref(), Some("srv2"));
 
         let body = json!({ "name": "nope.com" }).as_object().unwrap().clone();
-        let got = find_match(&m, &s, "x:Domain", &body, &key).unwrap();
+        let got = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap();
         assert_eq!(got, None);
     }
 
@@ -1542,7 +1932,7 @@ mod tests {
         ]);
         let body = json!({ "name": "dup.com" }).as_object().unwrap().clone();
         let key = resolve_match_key(&s, "x:Domain", None);
-        let err = find_match(&m, &s, "x:Domain", &body, &key).unwrap_err();
+        let err = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap_err();
         assert!(format!("{err}").contains("ambiguous"));
     }
 
@@ -1552,7 +1942,7 @@ mod tests {
         let m = matcher_with(vec![json!({ "id": "srv1", "name": "a.com" })]);
         let body = json!({ "description": "x" }).as_object().unwrap().clone();
         let key = resolve_match_key(&s, "x:Domain", None);
-        let err = find_match(&m, &s, "x:Domain", &body, &key).unwrap_err();
+        let err = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap_err();
         assert!(format!("{err}").contains("match property `name`"));
     }
 
@@ -1570,14 +1960,14 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        let got = find_match(&m, &s, "x:Domain", &body, &key).unwrap();
+        let got = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap();
         assert_eq!(got.as_deref(), Some("srv2"));
 
         let changed = json!({ "name": "b.com", "description": "CHANGED" })
             .as_object()
             .unwrap()
             .clone();
-        let got = find_match(&m, &s, "x:Domain", &changed, &key).unwrap();
+        let got = find_match(&m, &s, "x:Domain", &changed, &key, &HashMap::new()).unwrap();
         assert_eq!(got, None, "a changed scalar must not match (creates new)");
     }
 
@@ -1606,5 +1996,492 @@ mod tests {
             Err(e) => e,
         };
         assert!(format!("{err}").contains("cannot upsert singleton"));
+    }
+
+    fn account_singleton_settings() -> Schema {
+        let mut s = Schema::default();
+        s.objects.insert(
+            "x:SystemSettings".into(),
+            ObjectType::Singleton {
+                description: String::new(),
+                permission_prefix: String::new(),
+                enterprise: false,
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn resolve_match_value_substitutes_object_id_ref() {
+        let s = account_schema();
+        let fields = s.fields.get("x:Account");
+        let ids: HashMap<String, String> = [("dom".to_string(), "srvD".to_string())]
+            .into_iter()
+            .collect();
+        let got =
+            resolve_match_value("x:Account", fields, "domainId", &json!("#dom"), &ids).unwrap();
+        assert_eq!(
+            got,
+            json!("srvD"),
+            "an ObjectId ref must resolve to the server id"
+        );
+    }
+
+    #[test]
+    fn resolve_match_value_leaves_non_reference_fields_untouched() {
+        let s = account_schema();
+        let fields = s.fields.get("x:Account");
+        let ids = HashMap::new();
+        let got = resolve_match_value("x:Account", fields, "name", &json!("#dom"), &ids).unwrap();
+        assert_eq!(
+            got,
+            json!("#dom"),
+            "a `#`-looking value in a non-ObjectId field is not a reference"
+        );
+    }
+
+    #[test]
+    fn resolve_match_value_unresolved_ref_is_error() {
+        let s = account_schema();
+        let fields = s.fields.get("x:Account");
+        let err = resolve_match_value(
+            "x:Account",
+            fields,
+            "domainId",
+            &json!("#missing"),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("references unresolved id `#missing`"),
+            "expected an unresolved-ref error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_match_value_literal_id_passes_through() {
+        let s = account_schema();
+        let fields = s.fields.get("x:Account");
+        let got = resolve_match_value(
+            "x:Account",
+            fields,
+            "domainId",
+            &json!("srvD"),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            json!("srvD"),
+            "a bare (non-#) id must not be looked up"
+        );
+    }
+
+    #[test]
+    fn find_match_resolves_ref_in_compound_key() {
+        let s = account_schema();
+        let m = matcher_for(
+            "x:Account",
+            vec![
+                json!({ "id": "a1", "name": "sales", "domainId": "srvA" }),
+                json!({ "id": "a2", "name": "sales", "domainId": "srvB" }),
+            ],
+        );
+        let ids: HashMap<String, String> = [("dom-b".to_string(), "srvB".to_string())]
+            .into_iter()
+            .collect();
+        let body = json!({ "name": "sales", "domainId": "#dom-b" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let key = MatchKey::Props(vec!["name".into(), "domainId".into()]);
+        let got = find_match(&m, &s, "x:Account", &body, &key, &ids).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("a2"),
+            "the effective primary key (name + resolved domainId) must select a2"
+        );
+    }
+
+    #[test]
+    fn find_match_unresolved_ref_in_key_is_error() {
+        let s = account_schema();
+        let m = matcher_for(
+            "x:Account",
+            vec![json!({ "id": "a1", "name": "sales", "domainId": "srvA" })],
+        );
+        let body = json!({ "name": "sales", "domainId": "#dom-x" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let key = MatchKey::Props(vec!["name".into(), "domainId".into()]);
+        let err = find_match(&m, &s, "x:Account", &body, &key, &HashMap::new()).unwrap_err();
+        assert!(format!("{err}").contains("references unresolved id `#dom-x`"));
+    }
+
+    #[test]
+    fn find_match_hash_literal_in_text_prop_is_not_a_ref() {
+        let s = account_schema();
+        let m = matcher_for(
+            "x:Account",
+            vec![json!({ "id": "a1", "name": "#literal", "domainId": "srvA" })],
+        );
+        let body = json!({ "name": "#literal" }).as_object().unwrap().clone();
+        let key = MatchKey::Props(vec!["name".into()]);
+        let got = find_match(&m, &s, "x:Account", &body, &key, &HashMap::new()).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("a1"),
+            "a literal `#` in a String field must compare as-is, not resolve"
+        );
+    }
+
+    #[test]
+    fn parses_reconcile_op() {
+        let input = "{\"@type\":\"reconcile\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\
+                     \"value\":{\"d1\":{\"name\":\"a.com\"}}}\n";
+        let ops = parse_ndjson_plan(input).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], RawOp::Reconcile { .. }));
+    }
+
+    #[test]
+    fn reconcile_allows_empty_value() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Domain".into(),
+            match_on: Some(vec!["name".into()]),
+            value: Map::new(),
+        }];
+        let plan =
+            Plan::resolve(&s, raw).expect("empty reconcile value means delete-all, not an error");
+        assert_eq!(plan.reconciles, 1);
+        assert_eq!(plan.reconcile_objects, 0);
+    }
+
+    #[test]
+    fn reconcile_singleton_is_rejected() {
+        let s = account_singleton_settings();
+        let raw = vec![RawOp::Reconcile {
+            object: "SystemSettings".into(),
+            match_on: None,
+            value: {
+                let mut m = Map::new();
+                m.insert("s1".into(), json!({ "x": 1 }));
+                m
+            },
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected an error for reconcile on a singleton"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("cannot reconcile singleton"));
+    }
+
+    #[test]
+    fn reconcile_empty_match_on_is_rejected() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Domain".into(),
+            match_on: Some(vec![]),
+            value: {
+                let mut m = Map::new();
+                m.insert("d1".into(), json!({ "name": "a.com" }));
+                m
+            },
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected an error for reconcile with an empty matchOn"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("empty `matchOn`"));
+    }
+
+    #[test]
+    fn leaked_ids_single_variant_flags_unmatched() {
+        let s = domain_schema();
+        let m = matcher_with(vec![
+            json!({ "id": "srv1", "name": "keep.com" }),
+            json!({ "id": "srv2", "name": "gone.com" }),
+        ]);
+        let outcome = UpsertOutcome {
+            created: 0,
+            updated: 1,
+            matched_ids: ["srv1".to_string()].into_iter().collect(),
+            plan_at_types: HashSet::new(),
+        };
+        let leaked = leaked_ids(&s, "x:Domain", &m, &outcome);
+        assert_eq!(
+            leaked,
+            vec!["srv2".to_string()],
+            "unmatched objects are leaked"
+        );
+    }
+
+    #[test]
+    fn leaked_ids_empty_plan_flags_everything() {
+        let s = domain_schema();
+        let m = matcher_with(vec![
+            json!({ "id": "srv1", "name": "a.com" }),
+            json!({ "id": "srv2", "name": "b.com" }),
+        ]);
+        let outcome = UpsertOutcome {
+            created: 0,
+            updated: 0,
+            matched_ids: HashSet::new(),
+            plan_at_types: HashSet::new(),
+        };
+        let mut leaked = leaked_ids(&s, "x:Domain", &m, &outcome);
+        leaked.sort();
+        assert_eq!(
+            leaked,
+            vec!["srv1".to_string(), "srv2".to_string()],
+            "an empty single-variant reconcile deletes all existing objects"
+        );
+    }
+
+    fn mta_route_multi_schema() -> Schema {
+        let mut s = Schema::default();
+        s.objects.insert("x:MtaRoute".into(), obj_type());
+        s.schemas.insert(
+            "x:MtaRoute".into(),
+            ObjectSchema::Multiple {
+                variants: vec![
+                    crate::schema::ObjectVariant {
+                        name: "Local".into(),
+                        label: String::new(),
+                        schema_name: Some("x:MtaRouteLocal".into()),
+                    },
+                    crate::schema::ObjectVariant {
+                        name: "Mx".into(),
+                        label: String::new(),
+                        schema_name: Some("x:MtaRouteMx".into()),
+                    },
+                ],
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn validate_plan_references_rejects_undeclared_matchon_ref() {
+        let s = account_schema();
+        let raw = vec![RawOp::Upsert {
+            object: "Account".into(),
+            match_on: Some(vec!["domainId".into()]),
+            value: {
+                let mut m = Map::new();
+                m.insert(
+                    "acc".into(),
+                    json!({ "@type": "User", "domainId": "#ghost" }),
+                );
+                m
+            },
+        }];
+        let plan = Plan::resolve(&s, raw).expect("plan resolves structurally");
+        let err = validate_plan_references(&s, &plan).unwrap_err();
+        assert!(
+            format!("{err}").contains("unresolved id `#ghost`"),
+            "an undeclared matchOn reference must be rejected upfront (dry-run safe)"
+        );
+    }
+
+    #[test]
+    fn validate_plan_references_accepts_declared_ref() {
+        let s = account_schema();
+        let raw = vec![
+            RawOp::Create {
+                object: "Account".into(),
+                value: {
+                    let mut m = Map::new();
+                    m.insert("dom".into(), json!({ "@type": "User", "name": "x" }));
+                    m
+                },
+            },
+            RawOp::Upsert {
+                object: "Account".into(),
+                match_on: Some(vec!["domainId".into()]),
+                value: {
+                    let mut m = Map::new();
+                    m.insert("acc".into(), json!({ "@type": "User", "domainId": "#dom" }));
+                    m
+                },
+            },
+        ];
+        let plan = Plan::resolve(&s, raw).expect("plan resolves structurally");
+        validate_plan_references(&s, &plan)
+            .expect("a reference produced by another op must validate");
+    }
+
+    #[test]
+    fn validate_plan_references_rejects_out_of_order_ref() {
+        let s = account_schema();
+        let raw = vec![
+            RawOp::Upsert {
+                object: "Account".into(),
+                match_on: Some(vec!["domainId".into()]),
+                value: {
+                    let mut m = Map::new();
+                    m.insert("acc".into(), json!({ "@type": "User", "domainId": "#dom" }));
+                    m
+                },
+            },
+            RawOp::Create {
+                object: "Account".into(),
+                value: {
+                    let mut m = Map::new();
+                    m.insert("dom".into(), json!({ "@type": "User", "name": "x" }));
+                    m
+                },
+            },
+        ];
+        let plan = Plan::resolve(&s, raw).expect("plan resolves structurally");
+        let err = validate_plan_references(&s, &plan).unwrap_err();
+        assert!(
+            format!("{err}").contains("unresolved id `#dom`"),
+            "a matchOn ref to a LATER op must be rejected (dry-run must match runtime order)"
+        );
+    }
+
+    #[test]
+    fn resolve_match_value_null_and_missing_field() {
+        let s = account_schema();
+        let fields = s.fields.get("x:Account");
+        let got = resolve_match_value(
+            "x:Account",
+            fields,
+            "domainId",
+            &Value::Null,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(got, Value::Null, "a null ObjectId value must pass through");
+        let got = resolve_match_value(
+            "x:Account",
+            None,
+            "domainId",
+            &json!("#dom"),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            json!("#dom"),
+            "with no field metadata the value is not treated as a reference"
+        );
+    }
+
+    #[test]
+    fn reconcile_without_match_key_is_rejected() {
+        let mut s = Schema::default();
+        s.objects.insert("x:Tracer".into(), obj_type());
+        let raw = vec![RawOp::Reconcile {
+            object: "Tracer".into(),
+            match_on: None,
+            value: {
+                let mut m = Map::new();
+                m.insert("t1".into(), json!({ "name": "x" }));
+                m
+            },
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected reconcile without a match key to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no match key") && msg.contains("value-match"),
+            "expected a value-fallback rejection for reconcile: {msg}"
+        );
+    }
+
+    #[test]
+    fn leaked_ids_multi_variant_skips_candidate_missing_at_type() {
+        let s = mta_route_multi_schema();
+        let m = matcher_for(
+            "x:MtaRoute",
+            vec![
+                json!({ "id": "l1", "@type": "Local", "name": "a" }),
+                json!({ "id": "x1", "name": "no-type" }),
+            ],
+        );
+        let outcome = UpsertOutcome {
+            created: 0,
+            updated: 0,
+            matched_ids: HashSet::new(),
+            plan_at_types: ["Local".to_string()].into_iter().collect(),
+        };
+        let leaked = leaked_ids(&s, "x:MtaRoute", &m, &outcome);
+        assert_eq!(
+            leaked,
+            vec!["l1".to_string()],
+            "a candidate with no @type must never be leaked by a multi-variant reconcile"
+        );
+    }
+
+    #[test]
+    fn leaked_ids_multi_variant_empty_plan_deletes_nothing() {
+        let s = mta_route_multi_schema();
+        let m = matcher_for(
+            "x:MtaRoute",
+            vec![
+                json!({ "id": "l1", "@type": "Local", "name": "a" }),
+                json!({ "id": "m1", "@type": "Mx", "name": "b" }),
+            ],
+        );
+        let outcome = UpsertOutcome {
+            created: 0,
+            updated: 0,
+            matched_ids: HashSet::new(),
+            plan_at_types: HashSet::new(),
+        };
+        let leaked = leaked_ids(&s, "x:MtaRoute", &m, &outcome);
+        assert!(
+            leaked.is_empty(),
+            "an empty-value reconcile on a multi-variant type must delete nothing"
+        );
+    }
+
+    #[test]
+    fn validate_plan_references_ignores_literal_hash_in_text_prop() {
+        let s = account_schema();
+        let raw = vec![RawOp::Upsert {
+            object: "Account".into(),
+            match_on: Some(vec!["name".into()]),
+            value: {
+                let mut m = Map::new();
+                m.insert("acc".into(), json!({ "@type": "User", "name": "#literal" }));
+                m
+            },
+        }];
+        let plan = Plan::resolve(&s, raw).expect("plan resolves structurally");
+        validate_plan_references(&s, &plan)
+            .expect("a `#` in a non-ObjectId matchOn field is a literal, not a reference");
+    }
+
+    #[test]
+    fn leaked_ids_multi_variant_only_touches_mentioned_types() {
+        let s = mta_route_multi_schema();
+        let m = matcher_for(
+            "x:MtaRoute",
+            vec![
+                json!({ "id": "l1", "@type": "Local", "name": "a" }),
+                json!({ "id": "l2", "@type": "Local", "name": "b" }),
+                json!({ "id": "m1", "@type": "Mx", "name": "c" }),
+            ],
+        );
+        let outcome = UpsertOutcome {
+            created: 0,
+            updated: 1,
+            matched_ids: ["l1".to_string()].into_iter().collect(),
+            plan_at_types: ["Local".to_string()].into_iter().collect(),
+        };
+        let leaked = leaked_ids(&s, "x:MtaRoute", &m, &outcome);
+        assert_eq!(
+            leaked,
+            vec!["l2".to_string()],
+            "only the unmatched Local is leaked; the Mx variant is not mentioned so it is left alone"
+        );
     }
 }

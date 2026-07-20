@@ -186,6 +186,27 @@ fn apply_done(plan: &[u8]) -> (u64, u64, u64) {
     panic!("apply --json produced no summary record");
 }
 
+fn apply_summary(plan: &[u8]) -> (u64, u64, u64, u64) {
+    let out = run_with_stdin(&["apply", "--stdin", "--json"], plan);
+    assert_ok(&out, "apply --json");
+    for line in stdout_string(&out).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).expect("apply --json line");
+        if v.get("op").and_then(Value::as_str) == Some("summary") {
+            let done = &v["done"];
+            return (
+                done["created"].as_u64().unwrap_or(0),
+                done["updated"].as_u64().unwrap_or(0),
+                done["destroyed"].as_u64().unwrap_or(0),
+                done["failed"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    panic!("apply --json produced no summary record");
+}
+
 fn parse_missing_ref(err: &str) -> Option<String> {
     let start = err.find("references ")? + "references ".len();
     let rest = &err[start..];
@@ -979,6 +1000,468 @@ fn apply_continue_on_error_attempts_all_and_counts_failures() {
     );
 }
 
+#[test]
+fn upsert_match_on_reference_id_resolves_client_ref() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let domain_name = format!("keyref-{suffix}.test");
+    let user_name = format!("ku-{suffix}");
+
+    let plan = |desc: &str| -> Vec<u8> {
+        format!(
+            "{{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\
+             \"value\":{{\"dom\":{{\"name\":\"{domain_name}\"}}}}}}\n\
+             {{\"@type\":\"upsert\",\"object\":\"Account\",\"matchOn\":[\"name\",\"domainId\"],\
+             \"value\":{{\"acc\":{{\"@type\":\"User\",\"name\":\"{user_name}\",\
+             \"domainId\":\"#dom\",\"description\":\"{desc}\"}}}}}}\n"
+        )
+        .into_bytes()
+    };
+
+    let (created, _u, failed) = apply_done(&plan("v1"));
+    assert_eq!(
+        (created, failed),
+        (2, 0),
+        "first apply must create the domain and the account keyed on it"
+    );
+
+    let domain_id = id_with("Domain", "name", &domain_name).expect("domain created");
+    let _tree = DomainTree(domain_id.clone());
+
+    let (created2, updated2, failed2) = apply_done(&plan("v2"));
+    assert_eq!(
+        (created2, failed2),
+        (0, 0),
+        "re-apply must resolve `#dom` inside the compound matchOn and update in place; \
+         before the fix the unresolved `#dom` broke the match and forced a duplicate create"
+    );
+    assert!(updated2 >= 1, "the account must update");
+    assert_eq!(
+        ids_with("Account", "name", &user_name).len(),
+        1,
+        "a broken reference match must not duplicate the account"
+    );
+    let account_id = id_with("Account", "name", &user_name).expect("account exists");
+    let account = get_json("Account", Some(&account_id));
+    assert_eq!(
+        account["domainId"].as_str(),
+        Some(domain_id.as_str()),
+        "the matched account must still point at the resolved domain"
+    );
+    assert_eq!(account["description"].as_str(), Some("v2"));
+}
+
+#[test]
+fn upsert_match_on_unresolved_reference_is_rejected() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let user_name = format!("noref-{suffix}");
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"Account\",\"matchOn\":[\"name\",\"domainId\"],\
+         \"value\":{{\"acc\":{{\"@type\":\"User\",\"name\":\"{user_name}\",\
+         \"domainId\":\"#ghost\"}}}}}}\n"
+    );
+    let out = run_with_stdin(&["apply", "--stdin"], plan.as_bytes());
+    assert!(
+        !out.status.success(),
+        "a matchOn reference with no producing op must be rejected, not silently mismatched"
+    );
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("unresolved id `#ghost`"),
+        "expected an unresolved-reference error: {err}"
+    );
+}
+
+#[test]
+fn dry_run_rejects_unresolved_match_reference() {
+    require_server!();
+    let user_name = format!("dryref-{}", unique_suffix());
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"Account\",\"matchOn\":[\"name\",\"domainId\"],\
+         \"value\":{{\"acc\":{{\"@type\":\"User\",\"name\":\"{user_name}\",\
+         \"domainId\":\"#ghost\"}}}}}}\n"
+    );
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan.as_bytes());
+    assert!(
+        !out.status.success(),
+        "dry-run must catch an unresolved matchOn reference before reporting success"
+    );
+    assert!(
+        stderr_string(&out).contains("unresolved id `#ghost`"),
+        "expected the unresolved-reference error at dry-run time: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn reconcile_converges_and_scopes_deletes_per_variant() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let a = format!("rc-a-{suffix}.test");
+    let b = format!("rc-b-{suffix}.test");
+    let mx = format!("rc-mx-{suffix}.test");
+    let _ga = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: a.clone(),
+    };
+    let _gb = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: b.clone(),
+    };
+    let _gmx = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: mx.clone(),
+    };
+
+    let seed = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}},\
+         \"b\":{{\"@type\":\"Local\",\"name\":\"{b}\"}}}}}}\n"
+    )
+    .into_bytes();
+    let (c, _u, d, f) = apply_summary(&seed);
+    assert_eq!(
+        (c, d, f),
+        (2, 0, 0),
+        "the seed reconcile must create two Local routes and destroy nothing"
+    );
+
+    let mx_created = run_args(&[
+        "create",
+        "MtaRoute/Mx",
+        "--field",
+        &format!("name={mx}"),
+        "--field",
+        "ipLookupStrategy=v4ThenV6",
+        "--field",
+        "maxMultihomed=2",
+        "--field",
+        "maxMxHosts=5",
+    ]);
+    assert_ok(&mx_created, "create an out-of-band Mx route");
+
+    let converge = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}}}}}}\n"
+    )
+    .into_bytes();
+    let (_c2, _u2, d2, f2) = apply_summary(&converge);
+    assert_eq!(f2, 0, "the converging reconcile must not fail");
+    assert!(
+        d2 >= 1,
+        "the Local route dropped from the plan must be destroyed, not leaked"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &a).is_some(),
+        "the retained Local route must remain"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &b).is_none(),
+        "the dropped Local route must be gone"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &mx).is_some(),
+        "the Mx variant is absent from the plan's @types and must be left untouched"
+    );
+
+    let (c3, _u3, d3, f3) = apply_summary(&converge);
+    assert_eq!(
+        (c3, d3, f3),
+        (0, 0, 0),
+        "re-applying the converged reconcile must be a no-op"
+    );
+}
+
+#[test]
+fn reconcile_rename_does_not_leak_old_object() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let old = format!("rcren-old-{suffix}.test");
+    let new = format!("rcren-new-{suffix}.test");
+    let _go = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: old.clone(),
+    };
+    let _gn = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: new.clone(),
+    };
+
+    let plan = |name: &str| -> Vec<u8> {
+        format!(
+            "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+             \"r\":{{\"@type\":\"Local\",\"name\":\"{name}\"}}}}}}\n"
+        )
+        .into_bytes()
+    };
+
+    let (c1, _u1, _d1, f1) = apply_summary(&plan(&old));
+    assert_eq!((c1, f1), (1, 0), "first reconcile must create the route");
+    assert!(id_with("MtaRoute", "name", &old).is_some());
+
+    let (_c2, _u2, d2, f2) = apply_summary(&plan(&new));
+    assert_eq!(f2, 0, "the rename reconcile must not fail");
+    assert!(
+        d2 >= 1,
+        "renaming (dropping the old name from the source) must destroy the old object; \
+         this is exactly the leak that plain upsert cannot fix"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &new).is_some(),
+        "the renamed route must exist"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &old).is_none(),
+        "the old route must not leak"
+    );
+}
+
+#[test]
+fn reconcile_dry_run_makes_no_changes() {
+    require_server!();
+    let _serial = serial();
+    let name = format!("rc-dry-{}.test", unique_suffix());
+    let plan = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"r\":{{\"@type\":\"Local\",\"name\":\"{name}\"}}}}}}\n"
+    );
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan.as_bytes());
+    assert_ok(&out, "reconcile dry-run must be accepted");
+    assert!(
+        id_with("MtaRoute", "name", &name).is_none(),
+        "a dry-run reconcile must not create anything"
+    );
+}
+
+#[test]
+fn reconcile_on_singleton_is_rejected() {
+    require_server!();
+    let plan =
+        b"{\"@type\":\"reconcile\",\"object\":\"SystemSettings\",\"value\":{\"s1\":{\"defaultHostname\":\"x\"}}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "reconcile on a singleton must be rejected"
+    );
+    assert!(
+        stderr_string(&out).contains("cannot reconcile singleton"),
+        "expected a singleton-rejection message: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn reconcile_creates_and_deletes_in_one_op() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let a = format!("rccd-a-{suffix}.test");
+    let b = format!("rccd-b-{suffix}.test");
+    let c = format!("rccd-c-{suffix}.test");
+    let _ga = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: a.clone(),
+    };
+    let _gb = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: b.clone(),
+    };
+    let _gc = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: c.clone(),
+    };
+
+    let seed = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}},\
+         \"b\":{{\"@type\":\"Local\",\"name\":\"{b}\"}}}}}}\n"
+    )
+    .into_bytes();
+    let (c0, _u0, d0, f0) = apply_summary(&seed);
+    assert_eq!((c0, d0, f0), (2, 0, 0), "seed creates two Local routes");
+
+    let step = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}},\
+         \"c\":{{\"@type\":\"Local\",\"name\":\"{c}\"}}}}}}\n"
+    )
+    .into_bytes();
+    let (c1, _u1, d1, f1) = apply_summary(&step);
+    assert_eq!(f1, 0, "the combined create+delete reconcile must not fail");
+    assert_eq!(c1, 1, "exactly the new route (c) must be created");
+    assert_eq!(d1, 1, "exactly the dropped route (b) must be destroyed");
+    assert!(id_with("MtaRoute", "name", &a).is_some(), "a is retained");
+    assert!(id_with("MtaRoute", "name", &c).is_some(), "c is created");
+    assert!(id_with("MtaRoute", "name", &b).is_none(), "b is deleted");
+}
+
+#[test]
+fn reconcile_multi_variant_empty_value_deletes_nothing() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let local = format!("rcev-l-{suffix}.test");
+    let mx = format!("rcev-m-{suffix}.test");
+    let _gl = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: local.clone(),
+    };
+    let _gm = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: mx.clone(),
+    };
+
+    let seed = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"l\":{{\"@type\":\"Local\",\"name\":\"{local}\"}}}}}}\n"
+    )
+    .into_bytes();
+    assert_eq!(apply_summary(&seed).3, 0, "seed must not fail");
+    let mx_created = run_args(&[
+        "create",
+        "MtaRoute/Mx",
+        "--field",
+        &format!("name={mx}"),
+        "--field",
+        "ipLookupStrategy=v4ThenV6",
+        "--field",
+        "maxMultihomed=2",
+        "--field",
+        "maxMxHosts=5",
+    ]);
+    assert_ok(&mx_created, "create Mx route");
+
+    let empty =
+        b"{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{}}\n";
+    let (c, _u, d, f) = apply_summary(empty);
+    assert_eq!(
+        (c, d, f),
+        (0, 0, 0),
+        "an empty-value reconcile on a multi-variant type must be a pure no-op (no @types named)"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &local).is_some() && id_with("MtaRoute", "name", &mx).is_some(),
+        "both variants must survive an empty multi-variant reconcile"
+    );
+}
+
+#[test]
+fn reconcile_cleanup_emits_json_record() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let a = format!("rcj-a-{suffix}.test");
+    let b = format!("rcj-b-{suffix}.test");
+    let _ga = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: a.clone(),
+    };
+    let _gb = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: b.clone(),
+    };
+
+    let seed = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}},\
+         \"b\":{{\"@type\":\"Local\",\"name\":\"{b}\"}}}}}}\n"
+    )
+    .into_bytes();
+    assert_eq!(apply_summary(&seed).3, 0, "seed must not fail");
+
+    let step = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}}}}}}\n"
+    );
+    let out = run_with_stdin(&["apply", "--stdin", "--json"], step.as_bytes());
+    assert_ok(&out, "converging reconcile");
+    let cleanup = stdout_string(&out)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| {
+            v.get("op").and_then(Value::as_str) == Some("reconcile")
+                && v.get("stage").and_then(Value::as_str) == Some("cleanup")
+        })
+        .expect("a reconcile cleanup NDJSON record must be emitted");
+    assert!(
+        cleanup["destroyed"].as_u64().unwrap_or(0) >= 1,
+        "the cleanup record must report the destroyed count: {cleanup}"
+    );
+}
+
+#[test]
+fn reconcile_without_match_key_is_rejected() {
+    require_server!();
+    let plan =
+        b"{\"@type\":\"reconcile\",\"object\":\"Tracer\",\"value\":{\"t\":{\"description\":\"x\"}}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "reconcile on a keyless type without matchOn must be rejected (no silent value-match)"
+    );
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("no match key"),
+        "expected a value-fallback rejection: {err}"
+    );
+}
+
+#[test]
+fn reconcile_delete_blocked_by_external_reference_fails_cleanly() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let dn = format!("rcblock-d-{suffix}.test");
+    let other = format!("rcblock-o-{suffix}.test");
+
+    let d_id = create_domain(&dn);
+    let _dtree = DomainTree(d_id.clone());
+    let _acc = create_account_user(&format!("bu-{suffix}"), &d_id);
+
+    let plan = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"keep\":{{\"name\":\"{other}\"}}}}}}\n"
+    );
+    let out = run_with_stdin(&["apply", "--stdin", "--json"], plan.as_bytes());
+    let _other_guard = id_with("Domain", "name", &other).map(DomainTree);
+
+    assert!(
+        !out.status.success(),
+        "destroying a domain still referenced by an account must fail the reconcile"
+    );
+    let failed = stdout_string(&out)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("op").and_then(Value::as_str) == Some("summary"))
+        .and_then(|v| v["done"]["failed"].as_u64())
+        .unwrap_or(0);
+    assert!(
+        failed >= 1,
+        "the blocked deletion must be counted as failed"
+    );
+    assert!(
+        id_with("Domain", "name", &dn).is_some(),
+        "the referenced domain must survive the failed deletion (no orphaning)"
+    );
+}
+
 fn self_signed_pem() -> (String, String) {
     let ck = rcgen::generate_simple_self_signed(vec!["itest-cert.example.com".to_string()])
         .expect("generate self-signed certificate");
@@ -1061,7 +1544,10 @@ fn upsert_certificate_matches_on_server_set_label() {
         "delete the certificate",
     );
     let (c3, _u3, f3) = apply_done(plan.as_bytes());
-    assert_eq!(f3, 0, "create path must strip the server-set SAN and succeed");
+    assert_eq!(
+        f3, 0,
+        "create path must strip the server-set SAN and succeed"
+    );
     assert!(c3 >= 1, "the missing certificate must be created");
     assert_eq!(
         ids_for("Certificate").len(),
@@ -1139,7 +1625,11 @@ fn snapshot_certificate_env_var_variant_round_trips() {
     );
 
     let (c1, _u1, f1) = apply_done(plan.as_bytes());
-    assert_eq!((c1, f1), (0, 0), "re-applying must match the existing certificate");
+    assert_eq!(
+        (c1, f1),
+        (0, 0),
+        "re-applying must match the existing certificate"
+    );
     let (c2, _u2, f2) = apply_done(plan.as_bytes());
     assert_eq!((c2, f2), (0, 0), "the snapshot must be idempotent");
 
@@ -1151,8 +1641,14 @@ fn snapshot_certificate_env_var_variant_round_trips() {
         );
     }
     let (c3, _u3, f3) = apply_done(plan.as_bytes());
-    assert_eq!(f3, 0, "restore must not fail (SAN stripped on create, re-derived)");
-    assert!(c3 >= 1, "the deleted certificate must be recreated from the snapshot");
+    assert_eq!(
+        f3, 0,
+        "restore must not fail (SAN stripped on create, re-derived)"
+    );
+    assert!(
+        c3 >= 1,
+        "the deleted certificate must be recreated from the snapshot"
+    );
     assert_eq!(
         ids_for("Certificate").len(),
         count,

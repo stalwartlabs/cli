@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.11] - 2026-07-02
+
+### Added
+- `reconcile` plan op for `apply`: an exhaustive `upsert` that also destroys objects absent from the plan (#18).
+
+### Changed
+
+### Fixed
+- `matchOn` now resolves `#client-id` references on reference fields (#17).
+
 ## [1.0.10] - 2026-07-02
 
 ### Added

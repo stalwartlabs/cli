@@ -277,7 +277,7 @@ jobs:
     steps:
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
       - name: Fetch npm tarball
         uses: actions/download-artifact@v8
         with:

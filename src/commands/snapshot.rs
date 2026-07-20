@@ -1267,8 +1267,14 @@ fn transform_object(
             }
         }
         let Some(raw) = input.get(name) else { continue };
-        let transformed =
-            transform_value(schema, &field.typ, raw.clone(), allow, include_secrets, anon);
+        let transformed = transform_value(
+            schema,
+            &field.typ,
+            raw.clone(),
+            allow,
+            include_secrets,
+            anon,
+        );
         let Some(v) = transformed else { continue };
         out.insert(name.clone(), v);
     }
@@ -1465,8 +1471,14 @@ fn transform_embedded(
             }
         }
         let Some(raw) = map.get(name) else { continue };
-        if let Some(v) = transform_value(schema, &field.typ, raw.clone(), allow, include_secrets, anon)
-        {
+        if let Some(v) = transform_value(
+            schema,
+            &field.typ,
+            raw.clone(),
+            allow,
+            include_secrets,
+            anon,
+        ) {
             out.insert(name.clone(), v);
         }
     }
@@ -1486,7 +1498,8 @@ fn transform_object_list(
     };
     let mut out = Map::with_capacity(map.len());
     for (idx, item) in map {
-        if let Some(tv) = transform_embedded(schema, object_name, item, allow, include_secrets, anon)
+        if let Some(tv) =
+            transform_embedded(schema, object_name, item, allow, include_secrets, anon)
         {
             out.insert(idx, tv);
         }
