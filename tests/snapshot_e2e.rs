@@ -1655,3 +1655,218 @@ fn snapshot_certificate_env_var_variant_round_trips() {
         "restore must bring the certificate count back"
     );
 }
+
+struct DomainNameGuard(String);
+
+impl Drop for DomainNameGuard {
+    fn drop(&mut self) {
+        for id in ids_with("Domain", "name", &self.0) {
+            purge_domain(&id);
+        }
+    }
+}
+
+#[test]
+fn upsert_repeated_in_one_plan_matches_what_the_earlier_op_created() {
+    require_server!();
+    let _serial = serial();
+    let name = format!("dup-upsert-{}.test", unique_suffix());
+    let _guard = DomainNameGuard(name.clone());
+
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\
+         \"value\":{{\"d1\":{{\"name\":\"{name}\",\"description\":\"first\"}}}}}}\n\
+         {{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\
+         \"value\":{{\"d2\":{{\"name\":\"{name}\",\"description\":\"second\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (created, updated, destroyed, failed) = apply_summary(&plan);
+    assert_eq!(
+        (created, updated, destroyed, failed),
+        (1, 1, 0, 0),
+        "the second upsert of the same match key must update what the first one created"
+    );
+
+    let ids = ids_with("Domain", "name", &name);
+    assert_eq!(ids.len(), 1, "exactly one domain must exist: {ids:?}");
+    assert_eq!(
+        get_json("Domain", Some(&ids[0]))["description"].as_str(),
+        Some("second"),
+        "the later op must win"
+    );
+}
+
+#[test]
+fn upsert_matches_on_a_value_an_earlier_op_updated() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let name = format!("upd-match-{suffix}.test");
+    let tag = format!("tag-{suffix}");
+    let _guard = DomainNameGuard(name.clone());
+
+    let id = create_domain(&name);
+    assert_ok(
+        &run_args(&["update", "Domain", &id, "--field", "description=stale"]),
+        "seed the description",
+    );
+
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\
+         \"value\":{{\"d1\":{{\"name\":\"{name}\",\"description\":\"{tag}\"}}}}}}\n\
+         {{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"description\"],\
+         \"value\":{{\"d2\":{{\"name\":\"{name}\",\"description\":\"{tag}\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (created, _updated, _destroyed, failed) = apply_summary(&plan);
+    assert_eq!(
+        (created, failed),
+        (0, 0),
+        "the second upsert must match on the value the first one wrote, not the pre-plan value"
+    );
+    assert_eq!(
+        ids_with("Domain", "name", &name),
+        vec![id],
+        "no duplicate domain may be created"
+    );
+}
+
+#[test]
+fn upsert_with_two_entries_sharing_a_match_key_is_rejected() {
+    require_server!();
+    let _serial = serial();
+    let name = format!("same-key-{}.test", unique_suffix());
+    let _guard = DomainNameGuard(name.clone());
+
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\
+         \"value\":{{\"a\":{{\"name\":\"{name}\"}},\"b\":{{\"name\":\"{name}\"}}}}}}\n"
+    );
+    let out = run_with_stdin(&["apply", "--stdin"], plan.as_bytes());
+    assert!(
+        !out.status.success(),
+        "two entries with the same match key must be rejected"
+    );
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("same match key") && err.contains("operation #1"),
+        "the error must name the defect and the op: {err}"
+    );
+    assert!(
+        ids_with("Domain", "name", &name).is_empty(),
+        "the op must be rejected before anything is written"
+    );
+}
+
+#[test]
+fn reconcile_sees_what_an_earlier_upsert_created_in_the_same_plan() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let a = format!("mix-a-{suffix}.test");
+    let b = format!("mix-b-{suffix}.test");
+    let _ga = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: a.clone(),
+    };
+    let _gb = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: b.clone(),
+    };
+
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}}}}}}\n\
+         {{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}},\
+         \"b\":{{\"@type\":\"Local\",\"name\":\"{b}\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (created, _updated, _destroyed, failed) = apply_summary(&plan);
+    assert_eq!(
+        (created, failed),
+        (2, 0),
+        "the reconcile must match the route the upsert created and only create the new one"
+    );
+    assert_eq!(
+        ids_with("MtaRoute", "name", &a).len(),
+        1,
+        "the route named by both ops must not be duplicated"
+    );
+    assert_eq!(
+        ids_with("MtaRoute", "name", &b).len(),
+        1,
+        "the route only the reconcile names must be created"
+    );
+}
+
+struct LookupNamespaceGuard(String);
+
+impl Drop for LookupNamespaceGuard {
+    fn drop(&mut self) {
+        let ids = ids_where("MemoryLookupKey", &format!("namespace={}", self.0));
+        if !ids.is_empty() {
+            let _ = run_args(&["delete", "MemoryLookupKey", "--ids", &ids.join(",")]);
+        }
+    }
+}
+
+#[test]
+fn destroy_then_two_upserts_of_one_compound_key_is_idempotent() {
+    require_server!();
+    let _serial = serial();
+    let ns = format!("spam-traps-{}", unique_suffix());
+    let key = "trap@example.org";
+    let _guard = LookupNamespaceGuard(ns.clone());
+
+    assert_ok(
+        &run_args(&[
+            "create",
+            "MemoryLookupKey",
+            "--field",
+            &format!("namespace={ns}"),
+            "--field",
+            &format!("key={key}"),
+            "--field",
+            "isGlobPattern=false",
+        ]),
+        "seed the row the plan destroys",
+    );
+
+    let plan = format!(
+        "{{\"@type\":\"destroy\",\"object\":\"MemoryLookupKey\",\
+         \"value\":{{\"namespace\":\"{ns}\"}}}}\n\
+         {{\"@type\":\"upsert\",\"matchOn\":[\"namespace\",\"key\"],\
+         \"object\":\"MemoryLookupKey\",\
+         \"value\":{{\"lk-a\":{{\"key\":\"{key}\",\"namespace\":\"{ns}\"}}}}}}\n\
+         {{\"@type\":\"upsert\",\"matchOn\":[\"namespace\",\"key\"],\
+         \"object\":\"MemoryLookupKey\",\
+         \"value\":{{\"lk-a\":{{\"key\":\"{key}\",\"namespace\":\"{ns}\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (created, updated, destroyed, failed) = apply_summary(&plan);
+    assert_eq!(
+        (created, updated, destroyed, failed),
+        (1, 1, 1, 0),
+        "the second upsert of the compound key must update the row the first one created, \
+         not create it again"
+    );
+    assert_eq!(
+        ids_where("MemoryLookupKey", &format!("namespace={ns}")).len(),
+        1,
+        "the namespace must hold exactly one key"
+    );
+
+    let (created2, _updated2, destroyed2, failed2) = apply_summary(&plan);
+    assert_eq!(
+        (created2, destroyed2, failed2),
+        (1, 1, 0),
+        "re-running the whole plan must behave identically"
+    );
+}

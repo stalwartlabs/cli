@@ -2,7 +2,17 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.0.11] - 2026-07-02
+## [1.0.12] - 2026-07-XX
+
+### Added
+
+### Changed
+- `apply` rejects an `upsert`/`reconcile` op whose entries share a match key.
+
+### Fixed
+- `apply` no longer creates a duplicate when a plan upserts the same match key twice.
+
+## [1.0.11] - 2026-07-20
 
 ### Added
 - `reconcile` plan op for `apply`: an exhaustive `upsert` that also destroys objects absent from the plan (#18).

@@ -53,6 +53,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
             let result = execute_destroy(ctx, &jmap, canonical, filter.as_ref(), &reporter);
             match result {
                 Ok(count) => {
+                    matcher.invalidate(canonical);
                     state.summary.destroyed += count;
                     reporter.op_ok(*index, "destroy", canonical, count);
                 }
@@ -142,7 +143,10 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
                 value,
                 index,
             } => match execute_update(&jmap, canonical, id, value, &mut state.created_ids) {
-                Ok(count) => {
+                Ok((count, real_id)) => {
+                    if let Some(patch) = value.as_object() {
+                        matcher.record_updated(canonical, &real_id, patch);
+                    }
                     state.summary.updated += count;
                     reporter.op_ok(*index, "update", canonical, count);
                 }
@@ -170,7 +174,9 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
                     *index,
                     &reporter,
                 ) {
-                    Ok(count) => {
+                    Ok(objects) => {
+                        let count = objects.len();
+                        matcher.record_created(canonical, objects);
                         state.summary.created += count;
                         reporter.op_ok(*index, "create", canonical, count);
                     }
@@ -194,6 +200,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
         }
         match destroy_ids(&jmap, canonical, ids, batch_size, &reporter) {
             Ok(count) => {
+                matcher.invalidate(canonical);
                 state.summary.destroyed += count;
                 reporter.reconcile_cleanup(*index, canonical, count);
             }
@@ -861,6 +868,38 @@ impl Matcher {
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
+
+    fn record_created(&mut self, canonical: &str, objects: Vec<Map<String, Value>>) {
+        if let Some(cached) = self.objects.get_mut(canonical) {
+            cached.extend(objects);
+        }
+    }
+
+    fn record_updated(&mut self, canonical: &str, id: &str, patch: &Map<String, Value>) {
+        let Some(cached) = self.objects.get_mut(canonical) else {
+            return;
+        };
+        let Some(obj) = cached
+            .iter_mut()
+            .find(|o| o.get("id").and_then(Value::as_str) == Some(id))
+        else {
+            return;
+        };
+        for (prop, value) in patch {
+            if prop.contains('/') {
+                continue;
+            }
+            if value.is_null() {
+                obj.remove(prop);
+            } else {
+                obj.insert(prop.clone(), value.clone());
+            }
+        }
+    }
+
+    fn invalidate(&mut self, canonical: &str) {
+        self.objects.remove(canonical);
+    }
 }
 
 fn fetch_all_objects(
@@ -937,6 +976,83 @@ fn fetch_all_objects(
     Ok(all)
 }
 
+fn wanted_match_values<'a>(
+    schema: &Schema,
+    canonical: &str,
+    body: &Map<String, Value>,
+    props: &'a [String],
+    created_ids: &HashMap<String, String>,
+) -> CliResult<Vec<(&'a str, Value)>> {
+    let at_type = body.get("@type").and_then(Value::as_str);
+    let fields = fields_for(schema, canonical, at_type);
+    let mut wanted = Vec::with_capacity(props.len());
+    for p in props {
+        let Some(raw) = body.get(p) else {
+            return Err(CliError::msg(format!(
+                "{}: match property `{}` is missing from the object body",
+                resolve::display_name(canonical),
+                p,
+            )));
+        };
+        let resolved = resolve_match_value(canonical, fields, p, raw, created_ids)?;
+        wanted.push((p.as_str(), resolved));
+    }
+    Ok(wanted)
+}
+
+fn match_signature(
+    schema: &Schema,
+    canonical: &str,
+    body: &Map<String, Value>,
+    props: &[String],
+    created_ids: &HashMap<String, String>,
+) -> CliResult<String> {
+    let wanted = wanted_match_values(schema, canonical, body, props, created_ids)?;
+    let mut parts = Vec::with_capacity(wanted.len() + 1);
+    parts.push(match body.get("@type") {
+        Some(t) => t.clone(),
+        None => Value::Null,
+    });
+    for (_, v) in wanted {
+        parts.push(v);
+    }
+    Ok(Value::Array(parts).to_string())
+}
+
+fn reject_duplicate_match_keys(
+    schema: &Schema,
+    canonical: &str,
+    value: &Map<String, Value>,
+    key: &MatchKey,
+    created_ids: &HashMap<String, String>,
+    op_index: usize,
+) -> CliResult<()> {
+    let MatchKey::Props(props) = key else {
+        return Ok(());
+    };
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for (client_id, body_val) in value {
+        let Some(body) = body_val.as_object() else {
+            continue;
+        };
+        let Ok(signature) = match_signature(schema, canonical, body, props, created_ids) else {
+            continue;
+        };
+        if let Some(first) = seen.insert(signature, client_id.as_str()) {
+            return Err(CliError::msg(format!(
+                "{}: operation #{} has two entries (`{}`, `{}`) with the same match key on {}; \
+                 `matchOn` must uniquely identify each entry",
+                resolve::display_name(canonical),
+                op_index + 1,
+                first,
+                client_id,
+                props.join(", "),
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn find_match(
     matcher: &Matcher,
     schema: &Schema,
@@ -964,19 +1080,7 @@ fn find_match(
 
     match key {
         MatchKey::Props(props) => {
-            let fields = fields_for(schema, canonical, at_type);
-            let mut wanted: Vec<(&str, Value)> = Vec::with_capacity(props.len());
-            for p in props {
-                let Some(raw) = body.get(p) else {
-                    return Err(CliError::msg(format!(
-                        "{}: match property `{}` is missing from the object body",
-                        resolve::display_name(canonical),
-                        p,
-                    )));
-                };
-                let resolved = resolve_match_value(canonical, fields, p, raw, created_ids)?;
-                wanted.push((p.as_str(), resolved));
-            }
+            let wanted = wanted_match_values(schema, canonical, body, props, created_ids)?;
             let mut matched: Option<String> = None;
             let mut count = 0usize;
             for cand in candidates {
@@ -1129,6 +1233,14 @@ fn upsert_core(
     if matches!(key, MatchKey::Value) && matcher.warned_value_match.insert(canonical.to_string()) {
         reporter.value_match_warning(canonical);
     }
+    reject_duplicate_match_keys(
+        &ctx.schema,
+        canonical,
+        value,
+        &key,
+        &state.created_ids,
+        op_index,
+    )?;
 
     let mut to_create: Map<String, Value> = Map::new();
     let mut to_update: Vec<(String, Value)> = Vec::new();
@@ -1200,7 +1312,7 @@ fn upsert_core(
     let mut created = 0usize;
     if !to_create.is_empty() {
         let batch_size = ctx.session.max_objects_in_set.max(1);
-        created = execute_create(
+        let objects = execute_create(
             jmap,
             canonical,
             &to_create,
@@ -1209,11 +1321,21 @@ fn upsert_core(
             op_index,
             reporter,
         )?;
+        created = objects.len();
+        for obj in &objects {
+            if let Some(id) = obj.get("id").and_then(Value::as_str) {
+                matched_ids.insert(id.to_string());
+            }
+        }
+        matcher.record_created(canonical, objects);
     }
 
     let mut updated = 0usize;
     for (server_id, body) in &to_update {
-        updated += execute_update(jmap, canonical, server_id, body, &mut state.created_ids)?;
+        updated += execute_update(jmap, canonical, server_id, body, &mut state.created_ids)?.0;
+        if let Some(patch) = body.as_object() {
+            matcher.record_updated(canonical, server_id, patch);
+        }
     }
 
     Ok(UpsertOutcome {
@@ -1293,7 +1415,7 @@ fn execute_update(
     id: &str,
     value: &Value,
     created_ids: &mut HashMap<String, String>,
-) -> CliResult<usize> {
+) -> CliResult<(usize, String)> {
     let real_id = if let Some(r) = id.strip_prefix('#')
         && !r.is_empty()
     {
@@ -1352,7 +1474,7 @@ fn execute_update(
             real_id,
         )));
     }
-    Ok(updated)
+    Ok((updated, real_id))
 }
 
 fn execute_create(
@@ -1363,12 +1485,12 @@ fn execute_create(
     created_ids: &mut HashMap<String, String>,
     op_index: usize,
     reporter: &Reporter,
-) -> CliResult<usize> {
+) -> CliResult<Vec<Map<String, Value>>> {
     let entries: Vec<(&String, &Value)> = value.iter().collect();
     let method = format!("{canonical}/set");
     let total = entries.len();
     let batches = total.div_ceil(batch_size);
-    let mut created_count = 0usize;
+    let mut created_objects: Vec<Map<String, Value>> = Vec::with_capacity(total);
 
     for (n, chunk) in entries.chunks(batch_size).enumerate() {
         let created_in_request: HashSet<String> = chunk.iter().map(|(k, _)| (*k).clone()).collect();
@@ -1419,14 +1541,26 @@ fn execute_create(
 
         if let Some(created) = result.get("created").and_then(Value::as_object) {
             for (user_id, body) in created {
-                if let Some(server_id) = body.get("id").and_then(Value::as_str) {
-                    created_ids.insert(user_id.clone(), server_id.to_string());
+                let Some(server_id) = body.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                created_ids.insert(user_id.clone(), server_id.to_string());
+
+                let mut obj = create_map
+                    .get(user_id)
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(assigned) = body.as_object() {
+                    for (prop, v) in assigned {
+                        obj.insert(prop.clone(), v.clone());
+                    }
                 }
+                created_objects.push(obj);
             }
-            created_count += created.len();
         }
     }
-    Ok(created_count)
+    Ok(created_objects)
 }
 
 fn check_single_response(resp: CallResponse, expected_name: &str) -> CliResult<Value> {
@@ -2482,6 +2616,223 @@ mod tests {
             leaked,
             vec!["l2".to_string()],
             "only the unmatched Local is leaked; the Mx variant is not mentioned so it is left alone"
+        );
+    }
+
+    #[test]
+    fn record_created_makes_a_later_match_succeed() {
+        let s = domain_schema();
+        let mut m = matcher_with(vec![]);
+        let key = resolve_match_key(&s, "x:Domain", None);
+        let body = json!({ "name": "a.com" }).as_object().unwrap().clone();
+
+        assert_eq!(
+            find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap(),
+            None,
+            "nothing exists yet"
+        );
+
+        m.record_created(
+            "x:Domain",
+            vec![
+                json!({ "id": "srv9", "name": "a.com" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ],
+        );
+
+        assert_eq!(
+            find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new())
+                .unwrap()
+                .as_deref(),
+            Some("srv9"),
+            "a second upsert of the same key in one plan must match what the first one created"
+        );
+    }
+
+    #[test]
+    fn record_created_ignores_types_that_are_not_cached() {
+        let mut m = Matcher::new();
+        m.record_created(
+            "x:Domain",
+            vec![
+                json!({ "id": "srv9", "name": "a.com" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ],
+        );
+        assert!(
+            !m.objects.contains_key("x:Domain"),
+            "recording must not fabricate a cache entry, or `ensure` would skip the full fetch"
+        );
+        assert!(m.objects_for("x:Domain").is_empty());
+    }
+
+    #[test]
+    fn record_updated_patches_the_cached_object() {
+        let s = domain_schema();
+        let mut m = matcher_with(vec![json!({ "id": "srv1", "name": "old.com" })]);
+        let patch = json!({ "name": "new.com" }).as_object().unwrap().clone();
+        m.record_updated("x:Domain", "srv1", &patch);
+
+        let key = resolve_match_key(&s, "x:Domain", None);
+        let body = json!({ "name": "new.com" }).as_object().unwrap().clone();
+        assert_eq!(
+            find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new())
+                .unwrap()
+                .as_deref(),
+            Some("srv1"),
+            "a later match key must see the value an earlier op wrote"
+        );
+    }
+
+    #[test]
+    fn record_updated_clears_nulls_and_skips_pointer_paths() {
+        let mut m = matcher_with(vec![
+            json!({ "id": "srv1", "name": "a.com", "description": "d" }),
+        ]);
+        let patch = json!({ "description": null, "settings/timeout": 30 })
+            .as_object()
+            .unwrap()
+            .clone();
+        m.record_updated("x:Domain", "srv1", &patch);
+
+        let cached = &m.objects_for("x:Domain")[0];
+        assert!(
+            !cached.contains_key("description"),
+            "null clears the property"
+        );
+        assert!(
+            !cached.contains_key("settings/timeout"),
+            "JSON-pointer patch keys are not top-level properties"
+        );
+        assert_eq!(cached.get("name"), Some(&json!("a.com")));
+    }
+
+    #[test]
+    fn record_updated_ignores_unknown_ids_and_uncached_types() {
+        let patch = json!({ "name": "b.com" }).as_object().unwrap().clone();
+        let mut m = matcher_with(vec![json!({ "id": "srv1", "name": "a.com" })]);
+        m.record_updated("x:Domain", "nope", &patch);
+        assert_eq!(
+            m.objects_for("x:Domain")[0].get("name"),
+            Some(&json!("a.com"))
+        );
+
+        let mut empty = Matcher::new();
+        empty.record_updated("x:Domain", "srv1", &patch);
+        assert!(!empty.objects.contains_key("x:Domain"));
+    }
+
+    #[test]
+    fn invalidate_drops_the_cached_snapshot() {
+        let mut m = matcher_with(vec![json!({ "id": "srv1", "name": "a.com" })]);
+        m.invalidate("x:Domain");
+        assert!(
+            !m.objects.contains_key("x:Domain"),
+            "the next `ensure` must refetch after a destroy"
+        );
+    }
+
+    #[test]
+    fn duplicate_match_keys_in_one_op_are_rejected() {
+        let s = domain_schema();
+        let key = resolve_match_key(&s, "x:Domain", Some(&["name".to_string()]));
+        let mut value = Map::new();
+        value.insert("a".into(), json!({ "name": "dup.com" }));
+        value.insert("b".into(), json!({ "name": "dup.com" }));
+
+        let err = reject_duplicate_match_keys(&s, "x:Domain", &value, &key, &HashMap::new(), 2)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("operation #3"), "message names the op: {msg}");
+        assert!(
+            msg.contains("`a`") && msg.contains("`b`"),
+            "message names both entries: {msg}"
+        );
+        assert!(msg.contains("same match key"), "{msg}");
+    }
+
+    #[test]
+    fn distinct_match_keys_in_one_op_are_allowed() {
+        let s = domain_schema();
+        let key = resolve_match_key(&s, "x:Domain", None);
+        let mut value = Map::new();
+        value.insert("a".into(), json!({ "name": "a.com" }));
+        value.insert("b".into(), json!({ "name": "b.com" }));
+        reject_duplicate_match_keys(&s, "x:Domain", &value, &key, &HashMap::new(), 0)
+            .expect("distinct keys are fine");
+    }
+
+    #[test]
+    fn duplicate_check_is_skipped_for_value_fallback_matching() {
+        let mut bare = Schema::default();
+        bare.objects.insert("x:Tracer".into(), obj_type());
+        let key = resolve_match_key(&bare, "x:Tracer", None);
+        let mut value = Map::new();
+        value.insert("a".into(), json!({ "name": "same" }));
+        value.insert("b".into(), json!({ "name": "same" }));
+        reject_duplicate_match_keys(&bare, "x:Tracer", &value, &key, &HashMap::new(), 0)
+            .expect("value-fallback matching already warns; it is not key-based");
+    }
+
+    #[test]
+    fn duplicate_check_separates_variants_of_a_multi_variant_type() {
+        let s = mta_route_multi_schema();
+        let key = resolve_match_key(&s, "x:MtaRoute", Some(&["name".to_string()]));
+        let mut value = Map::new();
+        value.insert("a".into(), json!({ "@type": "Local", "name": "same" }));
+        value.insert("b".into(), json!({ "@type": "Mx", "name": "same" }));
+        reject_duplicate_match_keys(&s, "x:MtaRoute", &value, &key, &HashMap::new(), 0)
+            .expect("the same name under two variants is not the same object");
+
+        value.insert("c".into(), json!({ "@type": "Local", "name": "same" }));
+        reject_duplicate_match_keys(&s, "x:MtaRoute", &value, &key, &HashMap::new(), 0)
+            .expect_err("two Local routes with the same name collide");
+    }
+
+    #[test]
+    fn duplicate_check_resolves_references_before_comparing() {
+        let s = account_schema();
+        let key = resolve_match_key(
+            &s,
+            "x:Account",
+            Some(&["name".to_string(), "domainId".to_string()]),
+        );
+        let mut created = HashMap::new();
+        created.insert("dom-a".to_string(), "srv-dom".to_string());
+
+        let mut value = Map::new();
+        value.insert(
+            "acc1".into(),
+            json!({ "name": "jane", "domainId": "#dom-a" }),
+        );
+        value.insert(
+            "acc2".into(),
+            json!({ "name": "jane", "domainId": "srv-dom" }),
+        );
+        let err =
+            reject_duplicate_match_keys(&s, "x:Account", &value, &key, &created, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("same match key"),
+            "a `#ref` and the server id it resolves to are the same key"
+        );
+    }
+
+    #[test]
+    fn duplicate_check_defers_entries_it_cannot_resolve_yet() {
+        let s = account_schema();
+        let key = resolve_match_key(&s, "x:Account", Some(&["domainId".to_string()]));
+        let mut value = Map::new();
+        value.insert(
+            "acc1".into(),
+            json!({ "name": "jane", "domainId": "#later" }),
+        );
+        value.insert("acc2".into(), json!({ "name": "john" }));
+        reject_duplicate_match_keys(&s, "x:Account", &value, &key, &HashMap::new(), 0).expect(
+            "unresolved references and missing match properties stay `find_match`'s to report",
         );
     }
 }
