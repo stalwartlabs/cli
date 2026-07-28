@@ -10,6 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn hash_b64(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -91,14 +92,12 @@ impl SchemaCache {
 
     pub fn write(&self, hash: &str, bytes: &[u8]) -> CliResult<()> {
         let target = self.file_for(hash);
-        let tmp = with_suffix(&target, ".tmp");
-        fs::write(&tmp, bytes)?;
-        fs::rename(&tmp, &target)?;
+        let tmp = with_suffix(&target, &tmp_suffix());
+        write_then_rename(&tmp, &target, bytes)?;
 
         let latest = self.dir.join("latest");
-        let latest_tmp = self.dir.join("latest.tmp");
-        fs::write(&latest_tmp, hash.as_bytes())?;
-        fs::rename(&latest_tmp, &latest)?;
+        let latest_tmp = self.dir.join(format!("latest{}", tmp_suffix()));
+        write_then_rename(&latest_tmp, &latest, hash.as_bytes())?;
         Ok(())
     }
 
@@ -116,6 +115,27 @@ impl SchemaCache {
     }
 }
 
+fn write_then_rename(tmp: &Path, target: &Path, bytes: &[u8]) -> CliResult<()> {
+    if let Err(e) = fs::write(tmp, bytes) {
+        let _ = fs::remove_file(tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(tmp, target) {
+        let _ = fs::remove_file(tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+fn tmp_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     let mut s = p.as_os_str().to_os_string();
     s.push(suffix);
@@ -125,6 +145,48 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_names_are_unique_per_writer() {
+        let a = tmp_suffix();
+        let b = tmp_suffix();
+        assert_ne!(
+            a, b,
+            "two writers sharing a temp path can rename a half-written file into place"
+        );
+        assert!(a.contains(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn concurrent_writes_leave_a_complete_file() {
+        let dir = std::env::temp_dir().join(format!("stalwart-cli-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cache = SchemaCache { dir: dir.clone() };
+
+        let bytes = vec![b'x'; 512 * 1024];
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let cache = &cache;
+                let bytes = &bytes;
+                s.spawn(move || cache.write("h", bytes).unwrap());
+            }
+        });
+
+        assert_eq!(
+            cache.read("h").as_deref(),
+            Some(bytes.as_slice()),
+            "a reader must never observe a partially written schema"
+        );
+        assert_eq!(cache.latest_hash().as_deref(), Some("h"));
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must not be left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn normalise_lowercases_scheme_and_host() {

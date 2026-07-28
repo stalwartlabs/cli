@@ -1075,6 +1075,8 @@ fn fetch_all_partitioned(
         if let Some(a) = &anchor {
             q_args.insert("anchor".into(), Value::String(a.clone()));
             q_args.insert("anchorOffset".into(), Value::from(1));
+        } else {
+            q_args.insert("calculateTotal".into(), Value::Bool(true));
         }
         let get_args = json!({
             "#ids": { "resultOf": "q", "name": query_method, "path": "/ids" },
@@ -1101,31 +1103,33 @@ fn fetch_all_partitioned(
         let g_resp = iter
             .next()
             .ok_or_else(|| CliError::UnexpectedResponse("missing get response".into()))?;
-        check_response(q_resp, &query_method)?;
+        let q_result = check_response(q_resp, &query_method)?;
         let g_result = check_response(g_resp, &get_method)?;
 
-        let Some(list) = g_result.get("list").and_then(Value::as_array) else {
+        let Some(ids) = q_result.get("ids").and_then(Value::as_array) else {
             break;
         };
-        if list.is_empty() {
+        if ids.is_empty() {
             break;
         }
-        let last_id = list
+        let last_id = ids
             .last()
-            .and_then(|v| v.get("id").and_then(Value::as_str))
-            .map(String::from);
-        let returned = list.len();
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| {
+                CliError::UnexpectedResponse(format!("{query_method} returned a non-string id"))
+            })?;
+        let returned = ids.len();
 
-        partition_into(list, groups);
-        total += returned;
+        if let Some(list) = g_result.get("list").and_then(Value::as_array) {
+            partition_into(list, groups);
+            total += list.len();
+        }
 
         if returned < limit {
             break;
         }
-        match last_id {
-            Some(a) => anchor = Some(a),
-            None => break,
-        }
+        anchor = Some(last_id);
     }
     Ok(total)
 }

@@ -16,6 +16,7 @@ use crate::schema::resolve;
 use crate::schema::{Field, FieldType, Fields, ObjectSchema, ObjectType, Schema, StringFormat};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
@@ -38,6 +39,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
     let jmap = Jmap::new(&ctx.client, &ctx.session.api_path);
     let mut state = State {
         created_ids: HashMap::new(),
+        touched: HashMap::new(),
         summary: Summary::new(&plan),
     };
     let mut matcher = Matcher::new();
@@ -75,6 +77,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
             ResolvedOp::Upsert {
                 canonical,
                 match_on,
+                scope,
                 value,
                 index,
             } => {
@@ -82,7 +85,8 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
                     ctx,
                     &jmap,
                     canonical,
-                    match_on.as_deref(),
+                    match_on.as_ref(),
+                    scope.as_ref(),
                     value,
                     &mut state,
                     &mut matcher,
@@ -107,6 +111,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
             ResolvedOp::Reconcile {
                 canonical,
                 match_on,
+                scope,
                 value,
                 index,
             } => {
@@ -114,7 +119,8 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
                     ctx,
                     &jmap,
                     canonical,
-                    match_on.as_deref(),
+                    match_on.as_ref(),
+                    scope.as_ref(),
                     value,
                     &mut state,
                     &mut matcher,
@@ -147,6 +153,7 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
                     if let Some(patch) = value.as_object() {
                         matcher.record_updated(canonical, &real_id, patch);
                     }
+                    state.touch(canonical, &real_id);
                     state.summary.updated += count;
                     reporter.op_ok(*index, "update", canonical, count);
                 }
@@ -176,6 +183,11 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
                 ) {
                     Ok(objects) => {
                         let count = objects.len();
+                        for obj in &objects {
+                            if let Some(id) = obj.get("id").and_then(Value::as_str) {
+                                state.touch(canonical, id);
+                            }
+                        }
                         matcher.record_created(canonical, objects);
                         state.summary.created += count;
                         reporter.op_ok(*index, "create", canonical, count);
@@ -194,11 +206,18 @@ pub fn run(ctx: &Context, args: &ApplyArgs) -> CliResult<()> {
     }
 
     let batch_size = ctx.session.max_objects_in_set.max(1);
+    let mut already_destroyed: HashMap<String, HashSet<String>> = HashMap::new();
     for (canonical, index, ids) in reconcile_leaks.iter().rev() {
+        let seen = already_destroyed.entry(canonical.clone()).or_default();
+        let ids: Vec<String> = ids
+            .iter()
+            .filter(|id| !state.is_touched(canonical, id) && seen.insert((*id).clone()))
+            .cloned()
+            .collect();
         if ids.is_empty() {
             continue;
         }
-        match destroy_ids(&jmap, canonical, ids, batch_size, &reporter) {
+        match destroy_ids(&jmap, canonical, &ids, batch_size, &reporter) {
             Ok(count) => {
                 matcher.invalidate(canonical);
                 state.summary.destroyed += count;
@@ -260,37 +279,86 @@ fn read_input(args: &ApplyArgs) -> CliResult<String> {
     }
 }
 
+#[derive(Debug, Clone)]
+enum MatchOn {
+    Wildcard(String),
+    Props(Vec<String>),
+}
+
+const MATCH_ON_WILDCARD: &str = "*";
+
+impl<'de> Deserialize<'de> for MatchOn {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MatchOnVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for MatchOnVisitor {
+            type Value = MatchOn;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a list of property names or the string \"*\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<MatchOn, E> {
+                Ok(MatchOn::Wildcard(value.to_string()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<MatchOn, A::Error> {
+                let mut props = Vec::new();
+                while let Some(prop) = seq.next_element::<String>()? {
+                    props.push(prop);
+                }
+                Ok(MatchOn::Props(props))
+            }
+        }
+
+        deserializer.deserialize_any(MatchOnVisitor)
+    }
+}
+
 #[derive(Deserialize, Debug)]
-#[serde(tag = "@type", rename_all = "lowercase")]
+#[serde(tag = "@type", rename_all = "lowercase", deny_unknown_fields)]
 enum RawOp {
     Update {
         object: String,
         #[serde(default)]
         id: Option<String>,
         #[serde(default)]
+        scope: Option<Value>,
+        #[serde(default)]
         value: Value,
     },
     Destroy {
         object: String,
+        #[serde(default)]
+        scope: Option<Value>,
         #[serde(default)]
         value: Option<Value>,
     },
     Create {
         object: String,
         #[serde(default)]
+        scope: Option<Value>,
+        #[serde(default)]
         value: Map<String, Value>,
     },
     Upsert {
         object: String,
         #[serde(default, rename = "matchOn")]
-        match_on: Option<Vec<String>>,
+        match_on: Option<MatchOn>,
+        #[serde(default)]
+        scope: Option<Value>,
         #[serde(default)]
         value: Map<String, Value>,
     },
     Reconcile {
         object: String,
         #[serde(default, rename = "matchOn")]
-        match_on: Option<Vec<String>>,
+        match_on: Option<MatchOn>,
+        #[serde(default)]
+        scope: Option<Value>,
         #[serde(default)]
         value: Map<String, Value>,
     },
@@ -315,13 +383,15 @@ enum ResolvedOp {
     },
     Upsert {
         canonical: String,
-        match_on: Option<Vec<String>>,
+        match_on: Option<MatchOn>,
+        scope: Option<Map<String, Value>>,
         value: Map<String, Value>,
         index: usize,
     },
     Reconcile {
         canonical: String,
-        match_on: Option<Vec<String>>,
+        match_on: Option<MatchOn>,
+        scope: Option<Map<String, Value>>,
         value: Map<String, Value>,
         index: usize,
     },
@@ -353,8 +423,14 @@ impl Plan {
 
         for (index, r) in raw.into_iter().enumerate() {
             match r {
-                RawOp::Update { object, id, value } => {
+                RawOp::Update {
+                    object,
+                    id,
+                    scope,
+                    value,
+                } => {
                     let canonical = resolve::require_object(schema, &object)?;
+                    reject_scope(scope.as_ref(), "update", index)?;
                     let is_singleton = matches!(
                         schema.objects.get(canonical),
                         Some(ObjectType::Singleton { .. })
@@ -368,8 +444,13 @@ impl Plan {
                         index,
                     });
                 }
-                RawOp::Destroy { object, value } => {
+                RawOp::Destroy {
+                    object,
+                    scope,
+                    value,
+                } => {
                     let canonical = resolve::require_object(schema, &object)?;
+                    reject_scope(scope.as_ref(), "destroy", index)?;
                     if matches!(
                         schema.objects.get(canonical),
                         Some(ObjectType::Singleton { .. })
@@ -391,8 +472,13 @@ impl Plan {
                         index,
                     });
                 }
-                RawOp::Create { object, value } => {
+                RawOp::Create {
+                    object,
+                    scope,
+                    value,
+                } => {
                     let canonical = resolve::require_object(schema, &object)?;
+                    reject_scope(scope.as_ref(), "create", index)?;
                     if value.is_empty() {
                         return Err(CliError::msg(format!(
                             "create operation #{} has an empty `value` map (no objects to create)",
@@ -423,6 +509,7 @@ impl Plan {
                 RawOp::Upsert {
                     object,
                     match_on,
+                    scope,
                     value,
                 } => {
                     let canonical = resolve::require_object(schema, &object)?;
@@ -442,14 +529,9 @@ impl Plan {
                             index + 1,
                         )));
                     }
-                    if let Some(keys) = &match_on
-                        && keys.is_empty()
-                    {
-                        return Err(CliError::msg(format!(
-                            "upsert operation #{} has an empty `matchOn` list",
-                            index + 1,
-                        )));
-                    }
+                    validate_match_on(match_on.as_ref(), "upsert", index)?;
+                    let scope =
+                        resolve_scope_field(schema, canonical, scope, &value, "upsert", index)?;
 
                     let mut normalised = Map::new();
                     for (k, v) in value {
@@ -468,6 +550,7 @@ impl Plan {
                     ops.push(ResolvedOp::Upsert {
                         canonical: canonical.to_string(),
                         match_on,
+                        scope,
                         value: normalised,
                         index,
                     });
@@ -475,6 +558,7 @@ impl Plan {
                 RawOp::Reconcile {
                     object,
                     match_on,
+                    scope,
                     value,
                 } => {
                     let canonical = resolve::require_object(schema, &object)?;
@@ -488,26 +572,20 @@ impl Plan {
                             index + 1,
                         )));
                     }
-                    if let Some(keys) = &match_on
-                        && keys.is_empty()
+                    validate_match_on(match_on.as_ref(), "reconcile", index)?;
+                    if match_on.is_none()
+                        && matches!(resolve_match_key(schema, canonical, None), MatchKey::Value)
                     {
                         return Err(CliError::msg(format!(
-                            "reconcile operation #{} has an empty `matchOn` list",
-                            index + 1,
-                        )));
-                    }
-                    if matches!(
-                        resolve_match_key(schema, canonical, match_on.as_deref()),
-                        MatchKey::Value
-                    ) {
-                        return Err(CliError::msg(format!(
                             "reconcile operation #{} on `{}` has no match key; add a `matchOn` \
-                             (reconcile refuses to value-match, since a drifted object would be \
-                             deleted and recreated)",
+                             (or `\"matchOn\": \"*\"` to match by value, which deletes and \
+                             recreates any drifted object)",
                             index + 1,
                             resolve::display_name(canonical),
                         )));
                     }
+                    let scope =
+                        resolve_scope_field(schema, canonical, scope, &value, "reconcile", index)?;
 
                     let mut normalised = Map::new();
                     for (k, v) in value {
@@ -526,6 +604,7 @@ impl Plan {
                     ops.push(ResolvedOp::Reconcile {
                         canonical: canonical.to_string(),
                         match_on,
+                        scope,
                         value: normalised,
                         index,
                     });
@@ -574,7 +653,23 @@ fn resolve_update_id(
 
 struct State {
     created_ids: HashMap<String, String>,
+    touched: HashMap<String, HashSet<String>>,
     summary: Summary,
+}
+
+impl State {
+    fn touch(&mut self, canonical: &str, id: &str) {
+        let ids = self.touched.entry(canonical.to_string()).or_default();
+        if !ids.contains(id) {
+            ids.insert(id.to_string());
+        }
+    }
+
+    fn is_touched(&self, canonical: &str, id: &str) -> bool {
+        self.touched
+            .get(canonical)
+            .is_some_and(|ids| ids.contains(id))
+    }
 }
 
 struct Summary {
@@ -744,6 +839,8 @@ fn fetch_all_ids(
         if let Some(a) = &anchor {
             args.insert("anchor".to_string(), Value::String(a.clone()));
             args.insert("anchorOffset".to_string(), Value::from(1));
+        } else {
+            args.insert("calculateTotal".to_string(), Value::Bool(true));
         }
         let result = jmap.call(&method, Value::Object(args))?;
         let ids: Vec<String> = result
@@ -774,9 +871,187 @@ enum MatchKey {
     Value,
 }
 
-fn resolve_match_key(schema: &Schema, canonical: &str, match_on: Option<&[String]>) -> MatchKey {
-    if let Some(keys) = match_on {
-        return MatchKey::Props(keys.to_vec());
+fn resolve_scope_field(
+    schema: &Schema,
+    canonical: &str,
+    scope: Option<Value>,
+    value: &Map<String, Value>,
+    op: &str,
+    index: usize,
+) -> CliResult<Option<Map<String, Value>>> {
+    let scope = match scope {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(s)) if s.is_empty() => return Ok(None),
+        Some(Value::Object(s)) => s,
+        Some(_) => {
+            return Err(CliError::msg(format!(
+                "{op} operation #{} has a `scope` that is not a JSON object",
+                index + 1,
+            )));
+        }
+    };
+
+    let known = scope_properties(schema, canonical);
+    for (prop, wanted) in &scope {
+        if wanted.is_null() {
+            return Err(CliError::msg(format!(
+                "{op} operation #{} has a null `scope` value for `{}`; a null matches every \
+                 object that does not set the property, which would widen the scope rather \
+                 than narrow it",
+                index + 1,
+                prop,
+            )));
+        }
+        if prop == "@type" {
+            let declared = variant_names(schema, canonical);
+            if declared.is_empty() {
+                return Err(CliError::msg(format!(
+                    "{op} operation #{} has a `scope` on `@type`, but {} is not a \
+                     multi-variant type",
+                    index + 1,
+                    resolve::display_name(canonical),
+                )));
+            }
+            if !wanted.as_str().is_some_and(|w| declared.contains(&w)) {
+                let mut names: Vec<&str> = declared.into_iter().collect();
+                names.sort_unstable();
+                return Err(CliError::msg(format!(
+                    "{op} operation #{} has a `scope` on `@type` = {}, which is not a variant \
+                     of {}; expected one of {}",
+                    index + 1,
+                    wanted,
+                    resolve::display_name(canonical),
+                    names.join(", "),
+                )));
+            }
+            continue;
+        }
+        if scope_prop_is_server_set(schema, canonical, prop) {
+            return Err(CliError::msg(format!(
+                "{op} operation #{} has a `scope` on `{}`, which the server derives; an entry \
+                 cannot be created into that scope, so it would be recreated on every apply",
+                index + 1,
+                prop,
+            )));
+        }
+        if !known.is_empty() && !known.contains(prop.as_str()) {
+            return Err(CliError::msg(format!(
+                "{op} operation #{} has a `scope` on `{}`, which is not a property of {}; \
+                 the scope is matched client-side against property values, so operator forms \
+                 such as `{}Contains` are not supported",
+                index + 1,
+                prop,
+                resolve::display_name(canonical),
+                prop,
+            )));
+        }
+    }
+
+    for (client_id, body_val) in value {
+        let Some(body) = body_val.as_object() else {
+            continue;
+        };
+        for (prop, wanted) in &scope {
+            match body.get(prop) {
+                Some(actual)
+                    if actual != wanted
+                        && client_ref(actual).is_none() == client_ref(wanted).is_none() =>
+                {
+                    return Err(CliError::msg(format!(
+                        "{op} operation #{} declares `{}` with `{}` = {}, which is outside its \
+                         own `scope` ({} = {}); an out-of-scope entry can never match an \
+                         existing object, so it would be created again on every apply. Move it \
+                         to its own operation.",
+                        index + 1,
+                        client_id,
+                        prop,
+                        actual,
+                        prop,
+                        wanted,
+                    )));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(Some(scope))
+}
+
+fn scope_prop_is_server_set(schema: &Schema, canonical: &str, prop: &str) -> bool {
+    let is_server_set = |fields: Option<&Fields>| {
+        fields
+            .and_then(|f| f.properties.get(prop))
+            .is_some_and(|f| matches!(f.update, crate::schema::FieldUpdate::ServerSet))
+    };
+    match schema.schemas.get(canonical) {
+        Some(ObjectSchema::Single { schema_name }) => is_server_set(schema.fields.get(schema_name)),
+        Some(ObjectSchema::Multiple { variants }) => variants
+            .iter()
+            .any(|v| is_server_set(v.schema_name.as_ref().and_then(|sn| schema.fields.get(sn)))),
+        None => false,
+    }
+}
+
+fn variant_names<'a>(schema: &'a Schema, canonical: &str) -> HashSet<&'a str> {
+    match schema.schemas.get(canonical) {
+        Some(ObjectSchema::Multiple { variants }) => {
+            variants.iter().map(|v| v.name.as_str()).collect()
+        }
+        _ => HashSet::new(),
+    }
+}
+
+fn scope_properties<'a>(schema: &'a Schema, canonical: &str) -> HashSet<&'a str> {
+    let mut names = HashSet::new();
+    let mut add = |fields: Option<&'a Fields>| {
+        if let Some(f) = fields {
+            names.extend(f.properties.keys().map(String::as_str));
+        }
+    };
+    match schema.schemas.get(canonical) {
+        Some(ObjectSchema::Single { schema_name }) => add(schema.fields.get(schema_name)),
+        Some(ObjectSchema::Multiple { variants }) => {
+            for v in variants {
+                add(v.schema_name.as_ref().and_then(|sn| schema.fields.get(sn)));
+            }
+        }
+        None => {}
+    }
+    names
+}
+
+fn reject_scope(scope: Option<&Value>, op: &str, index: usize) -> CliResult<()> {
+    match scope {
+        None | Some(Value::Null) => Ok(()),
+        Some(_) => Err(CliError::msg(format!(
+            "{op} operation #{} has a `scope`; only upsert and reconcile match against \
+             existing objects",
+            index + 1,
+        ))),
+    }
+}
+
+fn validate_match_on(match_on: Option<&MatchOn>, op: &str, index: usize) -> CliResult<()> {
+    match match_on {
+        Some(MatchOn::Props(keys)) if keys.is_empty() => Err(CliError::msg(format!(
+            "{op} operation #{} has an empty `matchOn` list",
+            index + 1,
+        ))),
+        Some(MatchOn::Wildcard(w)) if w != MATCH_ON_WILDCARD => Err(CliError::msg(format!(
+            "{op} operation #{} has an invalid `matchOn` value `{w}`; expected a list of \
+             property names or `\"*\"`",
+            index + 1,
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn resolve_match_key(schema: &Schema, canonical: &str, match_on: Option<&MatchOn>) -> MatchKey {
+    match match_on {
+        Some(MatchOn::Props(keys)) => return MatchKey::Props(keys.clone()),
+        Some(MatchOn::Wildcard(_)) => return MatchKey::Value,
+        None => {}
     }
     if let Some(label) = schema
         .lists
@@ -917,6 +1192,9 @@ fn fetch_all_objects(
         let mut q_args = Map::new();
         q_args.insert("filter".into(), json!({}));
         q_args.insert("limit".into(), Value::from(limit));
+        if anchor.is_none() {
+            q_args.insert("calculateTotal".into(), Value::Bool(true));
+        }
         if let Some(a) = &anchor {
             q_args.insert("anchor".into(), Value::String(a.clone()));
             q_args.insert("anchorOffset".into(), Value::from(1));
@@ -946,32 +1224,36 @@ fn fetch_all_objects(
         let g_resp = iter
             .next()
             .ok_or_else(|| CliError::UnexpectedResponse("missing get response".into()))?;
-        check_response(q_resp, &query_method)?;
+        let q_result = check_response(q_resp, &query_method)?;
         let g_result = check_response(g_resp, &get_method)?;
 
-        let Some(list) = g_result.get("list").and_then(Value::as_array) else {
+        let Some(ids) = q_result.get("ids").and_then(Value::as_array) else {
             break;
         };
-        if list.is_empty() {
+        if ids.is_empty() {
             break;
         }
-        let last_id = list
+        let last_id = ids
             .last()
-            .and_then(|v| v.get("id").and_then(Value::as_str))
-            .map(String::from);
-        let returned = list.len();
-        for item in list {
-            if let Some(obj) = item.as_object() {
-                all.push(obj.clone());
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| {
+                CliError::UnexpectedResponse(format!("{query_method} returned a non-string id"))
+            })?;
+        let returned = ids.len();
+
+        if let Some(list) = g_result.get("list").and_then(Value::as_array) {
+            for item in list {
+                if let Some(obj) = item.as_object() {
+                    all.push(obj.clone());
+                }
             }
         }
+
         if returned < limit {
             break;
         }
-        match last_id {
-            Some(a) => anchor = Some(a),
-            None => break,
-        }
+        anchor = Some(last_id);
     }
     Ok(all)
 }
@@ -1022,20 +1304,56 @@ fn match_signature(
 fn reject_duplicate_match_keys(
     schema: &Schema,
     canonical: &str,
-    value: &Map<String, Value>,
+    entries: &[(&String, Cow<'_, Map<String, Value>>)],
     key: &MatchKey,
     created_ids: &HashMap<String, String>,
     op_index: usize,
 ) -> CliResult<()> {
-    let MatchKey::Props(props) = key else {
-        return Ok(());
-    };
     let mut seen: HashMap<String, &str> = HashMap::new();
-    for (client_id, body_val) in value {
-        let Some(body) = body_val.as_object() else {
-            continue;
-        };
-        let Ok(signature) = match_signature(schema, canonical, body, props, created_ids) else {
+    let props = match key {
+        MatchKey::Props(props) => props.clone(),
+        MatchKey::Value => {
+            let mut seen: HashMap<String, &str> = HashMap::new();
+            for (client_id, body) in entries {
+                let body = body.as_ref();
+                let at_type = body.get("@type").and_then(Value::as_str);
+                let Some(fields) = fields_for(schema, canonical, at_type) else {
+                    continue;
+                };
+                let mut parts: Vec<Value> = vec![match body.get("@type") {
+                    Some(t) => t.clone(),
+                    None => Value::Null,
+                }];
+                let mut names: Vec<&str> = fields
+                    .properties
+                    .iter()
+                    .filter(|(_, f)| is_comparable_scalar(f))
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                names.sort_unstable();
+                for n in names {
+                    parts.push(body.get(n).cloned().unwrap_or(Value::Null));
+                }
+                let signature = Value::Array(parts).to_string();
+                if let Some(first) = seen.insert(signature, client_id.as_str()) {
+                    return Err(CliError::msg(format!(
+                        "{}: operation #{} has two entries (`{}`, `{}`) with identical values; \
+                         value matching cannot tell them apart, so the second would be created \
+                         again on every apply",
+                        resolve::display_name(canonical),
+                        op_index + 1,
+                        first,
+                        client_id,
+                    )));
+                }
+            }
+            return Ok(());
+        }
+    };
+    let props = &props;
+    for (client_id, body) in entries {
+        let Ok(signature) = match_signature(schema, canonical, body.as_ref(), props, created_ids)
+        else {
             continue;
         };
         if let Some(first) = seen.insert(signature, client_id.as_str()) {
@@ -1059,6 +1377,7 @@ fn find_match(
     canonical: &str,
     body: &Map<String, Value>,
     key: &MatchKey,
+    scope: Option<&[(String, Value)]>,
     created_ids: &HashMap<String, String>,
 ) -> CliResult<Option<String>> {
     let multi = is_multi_variant(schema, canonical);
@@ -1071,11 +1390,10 @@ fn find_match(
     }
 
     let candidates = matcher.objects_for(canonical).iter().filter(|o| {
-        if multi {
-            o.get("@type").and_then(Value::as_str) == at_type
-        } else {
-            true
+        if multi && o.get("@type").and_then(Value::as_str) != at_type {
+            return false;
         }
+        in_scope(o, scope)
     });
 
     match key {
@@ -1084,7 +1402,10 @@ fn find_match(
             let mut matched: Option<String> = None;
             let mut count = 0usize;
             for cand in candidates {
-                if wanted.iter().all(|(p, r)| cand.get(*p) == Some(r)) {
+                if wanted
+                    .iter()
+                    .all(|(p, r)| values_match(cand.get(*p), Some(r)))
+                {
                     count += 1;
                     if matched.is_none() {
                         matched = cand.get("id").and_then(Value::as_str).map(String::from);
@@ -1121,12 +1442,28 @@ fn find_match(
                     resolve::display_name(canonical),
                 )));
             }
+            let mut matched: Option<String> = None;
+            let mut count = 0usize;
             for cand in candidates {
-                if props.iter().all(|p| cand.get(*p) == body.get(*p)) {
-                    return Ok(cand.get("id").and_then(Value::as_str).map(String::from));
+                if props
+                    .iter()
+                    .all(|p| values_match(cand.get(*p), body.get(*p)))
+                {
+                    count += 1;
+                    if matched.is_none() {
+                        matched = cand.get("id").and_then(Value::as_str).map(String::from);
+                    }
                 }
             }
-            Ok(None)
+            if count > 1 {
+                return Err(CliError::msg(format!(
+                    "{}: ambiguous match; {} existing objects have the same values; \
+                     add a `matchOn` naming the properties that identify the object",
+                    resolve::display_name(canonical),
+                    count,
+                )));
+            }
+            Ok(matched)
         }
     }
 }
@@ -1134,6 +1471,20 @@ fn find_match(
 fn validate_plan_references(schema: &Schema, plan: &Plan) -> CliResult<()> {
     let mut declared: HashMap<String, String> = HashMap::new();
     for op in &plan.ops {
+        if let ResolvedOp::Upsert {
+            canonical,
+            scope: Some(scope),
+            ..
+        }
+        | ResolvedOp::Reconcile {
+            canonical,
+            scope: Some(scope),
+            ..
+        } = op
+        {
+            resolve_scope(schema, canonical, scope, &declared)?;
+        }
+
         let value = match op {
             ResolvedOp::Create { value, .. }
             | ResolvedOp::Upsert { value, .. }
@@ -1157,7 +1508,7 @@ fn validate_plan_references(schema: &Schema, plan: &Plan) -> CliResult<()> {
             } => (canonical, match_on),
             _ => continue,
         };
-        let key = resolve_match_key(schema, canonical, match_on.as_deref());
+        let key = resolve_match_key(schema, canonical, match_on.as_ref());
         let MatchKey::Props(props) = &key else {
             continue;
         };
@@ -1213,7 +1564,7 @@ struct UpsertOutcome {
     created: usize,
     updated: usize,
     matched_ids: HashSet<String>,
-    plan_at_types: HashSet<String>,
+    scope: Option<Vec<(String, Value)>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1221,7 +1572,8 @@ fn upsert_core(
     ctx: &Context,
     jmap: &Jmap,
     canonical: &str,
-    match_on: Option<&[String]>,
+    match_on: Option<&MatchOn>,
+    scope: Option<&Map<String, Value>>,
     value: &Map<String, Value>,
     state: &mut State,
     matcher: &mut Matcher,
@@ -1229,23 +1581,23 @@ fn upsert_core(
     reporter: &Reporter,
 ) -> CliResult<UpsertOutcome> {
     matcher.ensure(ctx, jmap, canonical)?;
+    let scope = match scope {
+        Some(s) => Some(resolve_scope(
+            &ctx.schema,
+            canonical,
+            s,
+            &state.created_ids,
+        )?),
+        None => None,
+    };
     let key = resolve_match_key(&ctx.schema, canonical, match_on);
-    if matches!(key, MatchKey::Value) && matcher.warned_value_match.insert(canonical.to_string()) {
+    if matches!(key, MatchKey::Value)
+        && match_on.is_none()
+        && matcher.warned_value_match.insert(canonical.to_string())
+    {
         reporter.value_match_warning(canonical);
     }
-    reject_duplicate_match_keys(
-        &ctx.schema,
-        canonical,
-        value,
-        &key,
-        &state.created_ids,
-        op_index,
-    )?;
-
-    let mut to_create: Map<String, Value> = Map::new();
-    let mut to_update: Vec<(String, Value)> = Vec::new();
-    let mut matched_ids: HashSet<String> = HashSet::new();
-    let mut plan_at_types: HashSet<String> = HashSet::new();
+    let mut entries: Vec<(&String, Cow<'_, Map<String, Value>>)> = Vec::with_capacity(value.len());
     for (client_id, body_val) in value {
         let body = body_val.as_object().ok_or_else(|| {
             CliError::msg(format!(
@@ -1254,22 +1606,37 @@ fn upsert_core(
                 client_id,
             ))
         })?;
-        if let Some(at) = body.get("@type").and_then(Value::as_str) {
-            plan_at_types.insert(at.to_string());
-        }
+        entries.push((client_id, scoped_body(body, scope.as_deref())));
+    }
+
+    reject_duplicate_match_keys(
+        &ctx.schema,
+        canonical,
+        &entries,
+        &key,
+        &state.created_ids,
+        op_index,
+    )?;
+
+    let mut to_create: Map<String, Value> = Map::new();
+    let mut to_update: Vec<(String, Value)> = Vec::new();
+    let mut matched_ids: HashSet<String> = HashSet::new();
+    for (client_id, body) in &entries {
+        let body = body.as_ref();
         match find_match(
             matcher,
             &ctx.schema,
             canonical,
             body,
             &key,
+            scope.as_deref(),
             &state.created_ids,
         )? {
             Some(server_id) => {
                 matched_ids.insert(server_id.clone());
                 state
                     .created_ids
-                    .insert(client_id.clone(), server_id.clone());
+                    .insert((*client_id).clone(), server_id.clone());
                 let at_type = body.get("@type").and_then(Value::as_str);
                 let mut patch = body.clone();
                 patch.remove("@type");
@@ -1304,7 +1671,7 @@ fn upsert_core(
                             .unwrap_or(true)
                     });
                 }
-                to_create.insert(client_id.clone(), Value::Object(create_body));
+                to_create.insert((*client_id).clone(), Value::Object(create_body));
             }
         }
     }
@@ -1338,11 +1705,15 @@ fn upsert_core(
         }
     }
 
+    for id in &matched_ids {
+        state.touch(canonical, id);
+    }
+
     Ok(UpsertOutcome {
         created,
         updated,
         matched_ids,
-        plan_at_types,
+        scope,
     })
 }
 
@@ -1351,7 +1722,8 @@ fn execute_upsert(
     ctx: &Context,
     jmap: &Jmap,
     canonical: &str,
-    match_on: Option<&[String]>,
+    match_on: Option<&MatchOn>,
+    scope: Option<&Map<String, Value>>,
     value: &Map<String, Value>,
     state: &mut State,
     matcher: &mut Matcher,
@@ -1359,7 +1731,7 @@ fn execute_upsert(
     reporter: &Reporter,
 ) -> CliResult<(usize, usize)> {
     let outcome = upsert_core(
-        ctx, jmap, canonical, match_on, value, state, matcher, op_index, reporter,
+        ctx, jmap, canonical, match_on, scope, value, state, matcher, op_index, reporter,
     )?;
     Ok((outcome.created, outcome.updated))
 }
@@ -1369,7 +1741,8 @@ fn execute_reconcile(
     ctx: &Context,
     jmap: &Jmap,
     canonical: &str,
-    match_on: Option<&[String]>,
+    match_on: Option<&MatchOn>,
+    scope: Option<&Map<String, Value>>,
     value: &Map<String, Value>,
     state: &mut State,
     matcher: &mut Matcher,
@@ -1377,19 +1750,97 @@ fn execute_reconcile(
     reporter: &Reporter,
 ) -> CliResult<(usize, usize, Vec<String>)> {
     let outcome = upsert_core(
-        ctx, jmap, canonical, match_on, value, state, matcher, op_index, reporter,
+        ctx, jmap, canonical, match_on, scope, value, state, matcher, op_index, reporter,
     )?;
-    let leaked = leaked_ids(&ctx.schema, canonical, matcher, &outcome);
+    let leaked = leaked_ids(matcher, canonical, &outcome);
     Ok((outcome.created, outcome.updated, leaked))
 }
 
-fn leaked_ids(
+fn resolve_scope(
     schema: &Schema,
     canonical: &str,
-    matcher: &Matcher,
-    outcome: &UpsertOutcome,
-) -> Vec<String> {
-    let multi = is_multi_variant(schema, canonical);
+    filter: &Map<String, Value>,
+    created_ids: &HashMap<String, String>,
+) -> CliResult<Vec<(String, Value)>> {
+    let mut resolved = Vec::with_capacity(filter.len());
+    for (prop, raw) in filter {
+        let value =
+            match client_ref(raw).filter(|_| scope_prop_is_reference(schema, canonical, prop)) {
+                Some(client_id) => match created_ids.get(client_id) {
+                    Some(server_id) => Value::String(server_id.clone()),
+                    None => {
+                        return Err(CliError::msg(format!(
+                            "{}: `scope` property `{}` references unresolved id `#{}` \
+                         (no create, upsert, or reconcile operation in this plan produced it)",
+                            resolve::display_name(canonical),
+                            prop,
+                            client_id,
+                        )));
+                    }
+                },
+                None => raw.clone(),
+            };
+        resolved.push((prop.clone(), value));
+    }
+    Ok(resolved)
+}
+
+fn scoped_body<'a>(
+    body: &'a Map<String, Value>,
+    scope: Option<&[(String, Value)]>,
+) -> Cow<'a, Map<String, Value>> {
+    let Some(props) = scope else {
+        return Cow::Borrowed(body);
+    };
+    if props.iter().all(|(p, _)| body.contains_key(p)) {
+        return Cow::Borrowed(body);
+    }
+    let mut merged = body.clone();
+    for (p, wanted) in props {
+        merged.entry(p.clone()).or_insert_with(|| wanted.clone());
+    }
+    Cow::Owned(merged)
+}
+
+fn in_scope(candidate: &Map<String, Value>, scope: Option<&[(String, Value)]>) -> bool {
+    match scope {
+        None => true,
+        Some(props) => props
+            .iter()
+            .all(|(p, wanted)| values_match(candidate.get(p), Some(wanted))),
+    }
+}
+
+fn values_match(a: Option<&Value>, b: Option<&Value>) -> bool {
+    match (a, b) {
+        (None | Some(Value::Null), None | Some(Value::Null)) => true,
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn client_ref(raw: &Value) -> Option<&str> {
+    raw.as_str()
+        .and_then(|s| s.strip_prefix('#'))
+        .filter(|s| !s.is_empty())
+}
+
+fn scope_prop_is_reference(schema: &Schema, canonical: &str, prop: &str) -> bool {
+    let is_ref = |fields: Option<&Fields>| {
+        fields
+            .and_then(|f| f.properties.get(prop))
+            .is_some_and(|f| matches!(f.typ, FieldType::ObjectId { .. }))
+    };
+    match schema.schemas.get(canonical) {
+        Some(ObjectSchema::Single { schema_name }) => is_ref(schema.fields.get(schema_name)),
+        Some(ObjectSchema::Multiple { variants }) => variants
+            .iter()
+            .any(|v| is_ref(v.schema_name.as_ref().and_then(|sn| schema.fields.get(sn)))),
+        None => false,
+    }
+}
+
+fn leaked_ids(matcher: &Matcher, canonical: &str, outcome: &UpsertOutcome) -> Vec<String> {
     let mut leaked = Vec::new();
     for cand in matcher.objects_for(canonical) {
         let Some(id) = cand.get("id").and_then(Value::as_str) else {
@@ -1398,11 +1849,8 @@ fn leaked_ids(
         if outcome.matched_ids.contains(id) {
             continue;
         }
-        if multi {
-            match cand.get("@type").and_then(Value::as_str) {
-                Some(t) if outcome.plan_at_types.contains(t) => {}
-                _ => continue,
-            }
+        if !in_scope(cand, outcome.scope.as_deref()) {
+            continue;
         }
         leaked.push(id.to_string());
     }
@@ -1797,6 +2245,64 @@ fn past_tense(kind: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    fn lookup_key_schema() -> Schema {
+        use crate::schema::Fields;
+        let mut s = Schema::default();
+        s.objects.insert("x:MemoryLookupKey".into(), obj_type());
+        s.schemas.insert(
+            "x:MemoryLookupKey".into(),
+            ObjectSchema::Single {
+                schema_name: "x:MemoryLookupKey".into(),
+            },
+        );
+        let mut props = HashMap::new();
+        props.insert("namespace".to_string(), string_field());
+        props.insert("key".to_string(), string_field());
+        s.fields.insert(
+            "x:MemoryLookupKey".into(),
+            Fields {
+                properties: props,
+                defaults: HashMap::new(),
+            },
+        );
+        s
+    }
+
+    fn server_set_scope_schema() -> Schema {
+        use crate::schema::Fields;
+        let mut s = Schema::default();
+        s.objects.insert("x:Cert".into(), obj_type());
+        s.schemas.insert(
+            "x:Cert".into(),
+            ObjectSchema::Single {
+                schema_name: "x:Cert".into(),
+            },
+        );
+        let mut fingerprint = string_field();
+        fingerprint.update = crate::schema::FieldUpdate::ServerSet;
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), string_field());
+        props.insert("fingerprint".to_string(), fingerprint);
+        s.fields.insert(
+            "x:Cert".into(),
+            Fields {
+                properties: props,
+                defaults: HashMap::new(),
+            },
+        );
+        s
+    }
+
+    fn entries_of<'a>(
+        value: &'a Map<String, Value>,
+        scope: Option<&[(String, Value)]>,
+    ) -> Vec<(&'a String, std::borrow::Cow<'a, Map<String, Value>>)> {
+        value
+            .iter()
+            .map(|(k, v)| (k, scoped_body(v.as_object().unwrap(), scope)))
+            .collect()
+    }
+
     #[test]
     fn collects_string_refs() {
         let v = json!({ "a": "#x", "b": ["plain", "#y"], "c": "no ref" });
@@ -2012,9 +2518,10 @@ mod tests {
                 object,
                 match_on,
                 value,
+                ..
             } => {
                 assert_eq!(object, "Domain");
-                assert_eq!(match_on.as_deref(), Some(["name".to_string()].as_slice()));
+                assert!(matches!(match_on, Some(MatchOn::Props(p)) if p == &["name".to_string()]));
                 assert!(value.contains_key("d1"));
             }
             other => panic!("expected upsert, got {other:?}"),
@@ -2025,7 +2532,7 @@ mod tests {
     fn resolve_match_key_prefers_match_on_then_label_then_value() {
         let s = domain_schema();
         assert!(matches!(
-            resolve_match_key(&s, "x:Domain", Some(&["description".to_string()])),
+            resolve_match_key(&s, "x:Domain", Some(&MatchOn::Props(vec!["description".to_string()]))),
             MatchKey::Props(p) if p == ["description"]
         ));
         assert!(matches!(
@@ -2049,11 +2556,11 @@ mod tests {
         ]);
         let body = json!({ "name": "b.com" }).as_object().unwrap().clone();
         let key = resolve_match_key(&s, "x:Domain", None);
-        let got = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap();
+        let got = find_match(&m, &s, "x:Domain", &body, &key, None, &HashMap::new()).unwrap();
         assert_eq!(got.as_deref(), Some("srv2"));
 
         let body = json!({ "name": "nope.com" }).as_object().unwrap().clone();
-        let got = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap();
+        let got = find_match(&m, &s, "x:Domain", &body, &key, None, &HashMap::new()).unwrap();
         assert_eq!(got, None);
     }
 
@@ -2066,7 +2573,7 @@ mod tests {
         ]);
         let body = json!({ "name": "dup.com" }).as_object().unwrap().clone();
         let key = resolve_match_key(&s, "x:Domain", None);
-        let err = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap_err();
+        let err = find_match(&m, &s, "x:Domain", &body, &key, None, &HashMap::new()).unwrap_err();
         assert!(format!("{err}").contains("ambiguous"));
     }
 
@@ -2076,7 +2583,7 @@ mod tests {
         let m = matcher_with(vec![json!({ "id": "srv1", "name": "a.com" })]);
         let body = json!({ "description": "x" }).as_object().unwrap().clone();
         let key = resolve_match_key(&s, "x:Domain", None);
-        let err = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap_err();
+        let err = find_match(&m, &s, "x:Domain", &body, &key, None, &HashMap::new()).unwrap_err();
         assert!(format!("{err}").contains("match property `name`"));
     }
 
@@ -2094,14 +2601,14 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        let got = find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap();
+        let got = find_match(&m, &s, "x:Domain", &body, &key, None, &HashMap::new()).unwrap();
         assert_eq!(got.as_deref(), Some("srv2"));
 
         let changed = json!({ "name": "b.com", "description": "CHANGED" })
             .as_object()
             .unwrap()
             .clone();
-        let got = find_match(&m, &s, "x:Domain", &changed, &key, &HashMap::new()).unwrap();
+        let got = find_match(&m, &s, "x:Domain", &changed, &key, None, &HashMap::new()).unwrap();
         assert_eq!(got, None, "a changed scalar must not match (creates new)");
     }
 
@@ -2119,6 +2626,7 @@ mod tests {
         let raw = vec![RawOp::Upsert {
             object: "SystemSettings".into(),
             match_on: None,
+            scope: None,
             value: {
                 let mut m = Map::new();
                 m.insert("s1".into(), json!({ "x": 1 }));
@@ -2230,7 +2738,7 @@ mod tests {
             .unwrap()
             .clone();
         let key = MatchKey::Props(vec!["name".into(), "domainId".into()]);
-        let got = find_match(&m, &s, "x:Account", &body, &key, &ids).unwrap();
+        let got = find_match(&m, &s, "x:Account", &body, &key, None, &ids).unwrap();
         assert_eq!(
             got.as_deref(),
             Some("a2"),
@@ -2250,7 +2758,7 @@ mod tests {
             .unwrap()
             .clone();
         let key = MatchKey::Props(vec!["name".into(), "domainId".into()]);
-        let err = find_match(&m, &s, "x:Account", &body, &key, &HashMap::new()).unwrap_err();
+        let err = find_match(&m, &s, "x:Account", &body, &key, None, &HashMap::new()).unwrap_err();
         assert!(format!("{err}").contains("references unresolved id `#dom-x`"));
     }
 
@@ -2263,7 +2771,7 @@ mod tests {
         );
         let body = json!({ "name": "#literal" }).as_object().unwrap().clone();
         let key = MatchKey::Props(vec!["name".into()]);
-        let got = find_match(&m, &s, "x:Account", &body, &key, &HashMap::new()).unwrap();
+        let got = find_match(&m, &s, "x:Account", &body, &key, None, &HashMap::new()).unwrap();
         assert_eq!(
             got.as_deref(),
             Some("a1"),
@@ -2285,7 +2793,8 @@ mod tests {
         let s = domain_schema();
         let raw = vec![RawOp::Reconcile {
             object: "Domain".into(),
-            match_on: Some(vec!["name".into()]),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: None,
             value: Map::new(),
         }];
         let plan =
@@ -2300,6 +2809,7 @@ mod tests {
         let raw = vec![RawOp::Reconcile {
             object: "SystemSettings".into(),
             match_on: None,
+            scope: None,
             value: {
                 let mut m = Map::new();
                 m.insert("s1".into(), json!({ "x": 1 }));
@@ -2318,7 +2828,8 @@ mod tests {
         let s = domain_schema();
         let raw = vec![RawOp::Reconcile {
             object: "Domain".into(),
-            match_on: Some(vec![]),
+            match_on: Some(MatchOn::Props(vec![])),
+            scope: None,
             value: {
                 let mut m = Map::new();
                 m.insert("d1".into(), json!({ "name": "a.com" }));
@@ -2334,7 +2845,6 @@ mod tests {
 
     #[test]
     fn leaked_ids_single_variant_flags_unmatched() {
-        let s = domain_schema();
         let m = matcher_with(vec![
             json!({ "id": "srv1", "name": "keep.com" }),
             json!({ "id": "srv2", "name": "gone.com" }),
@@ -2343,9 +2853,9 @@ mod tests {
             created: 0,
             updated: 1,
             matched_ids: ["srv1".to_string()].into_iter().collect(),
-            plan_at_types: HashSet::new(),
+            scope: None,
         };
-        let leaked = leaked_ids(&s, "x:Domain", &m, &outcome);
+        let leaked = leaked_ids(&m, "x:Domain", &outcome);
         assert_eq!(
             leaked,
             vec!["srv2".to_string()],
@@ -2355,7 +2865,6 @@ mod tests {
 
     #[test]
     fn leaked_ids_empty_plan_flags_everything() {
-        let s = domain_schema();
         let m = matcher_with(vec![
             json!({ "id": "srv1", "name": "a.com" }),
             json!({ "id": "srv2", "name": "b.com" }),
@@ -2364,15 +2873,32 @@ mod tests {
             created: 0,
             updated: 0,
             matched_ids: HashSet::new(),
-            plan_at_types: HashSet::new(),
+            scope: None,
         };
-        let mut leaked = leaked_ids(&s, "x:Domain", &m, &outcome);
+        let mut leaked = leaked_ids(&m, "x:Domain", &outcome);
         leaked.sort();
         assert_eq!(
             leaked,
             vec!["srv1".to_string(), "srv2".to_string()],
             "an empty single-variant reconcile deletes all existing objects"
         );
+    }
+
+    fn mta_route_multi_schema_with_fields() -> Schema {
+        use crate::schema::Fields;
+        let mut s = mta_route_multi_schema();
+        for name in ["x:MtaRouteLocal", "x:MtaRouteMx"] {
+            let mut props = HashMap::new();
+            props.insert("name".to_string(), string_field());
+            s.fields.insert(
+                name.into(),
+                Fields {
+                    properties: props,
+                    defaults: HashMap::new(),
+                },
+            );
+        }
+        s
     }
 
     fn mta_route_multi_schema() -> Schema {
@@ -2403,7 +2929,8 @@ mod tests {
         let s = account_schema();
         let raw = vec![RawOp::Upsert {
             object: "Account".into(),
-            match_on: Some(vec!["domainId".into()]),
+            match_on: Some(MatchOn::Props(vec!["domainId".into()])),
+            scope: None,
             value: {
                 let mut m = Map::new();
                 m.insert(
@@ -2426,6 +2953,7 @@ mod tests {
         let s = account_schema();
         let raw = vec![
             RawOp::Create {
+                scope: None,
                 object: "Account".into(),
                 value: {
                     let mut m = Map::new();
@@ -2435,7 +2963,8 @@ mod tests {
             },
             RawOp::Upsert {
                 object: "Account".into(),
-                match_on: Some(vec!["domainId".into()]),
+                match_on: Some(MatchOn::Props(vec!["domainId".into()])),
+                scope: None,
                 value: {
                     let mut m = Map::new();
                     m.insert("acc".into(), json!({ "@type": "User", "domainId": "#dom" }));
@@ -2454,7 +2983,8 @@ mod tests {
         let raw = vec![
             RawOp::Upsert {
                 object: "Account".into(),
-                match_on: Some(vec!["domainId".into()]),
+                match_on: Some(MatchOn::Props(vec!["domainId".into()])),
+                scope: None,
                 value: {
                     let mut m = Map::new();
                     m.insert("acc".into(), json!({ "@type": "User", "domainId": "#dom" }));
@@ -2462,6 +2992,7 @@ mod tests {
                 },
             },
             RawOp::Create {
+                scope: None,
                 object: "Account".into(),
                 value: {
                     let mut m = Map::new();
@@ -2513,6 +3044,7 @@ mod tests {
         let raw = vec![RawOp::Reconcile {
             object: "Tracer".into(),
             match_on: None,
+            scope: None,
             value: {
                 let mut m = Map::new();
                 m.insert("t1".into(), json!({ "name": "x" }));
@@ -2525,38 +3057,682 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(
-            msg.contains("no match key") && msg.contains("value-match"),
-            "expected a value-fallback rejection for reconcile: {msg}"
+            msg.contains("no match key") && msg.contains("\"matchOn\": \"*\""),
+            "expected a value-fallback rejection pointing at the opt-in: {msg}"
         );
     }
 
     #[test]
-    fn leaked_ids_multi_variant_skips_candidate_missing_at_type() {
-        let s = mta_route_multi_schema();
+    fn value_match_treats_an_absent_property_as_null() {
+        let s = domain_schema();
+        let m = matcher_with(vec![json!({
+            "id": "srv1",
+            "name": "a.com",
+            "description": Value::Null,
+        })]);
+        let body = json!({ "name": "a.com" }).as_object().unwrap().clone();
+        let got = find_match(
+            &m,
+            &s,
+            "x:Domain",
+            &body,
+            &MatchKey::Value,
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("srv1"),
+            "a server-returned null must compare equal to a property the plan body omits, \
+             otherwise re-applying an unchanged plan looks like drift"
+        );
+    }
+
+    #[test]
+    fn value_match_still_sees_a_real_difference() {
+        let s = domain_schema();
+        let m = matcher_with(vec![json!({
+            "id": "srv1",
+            "name": "a.com",
+            "description": "set",
+        })]);
+        let body = json!({ "name": "a.com" }).as_object().unwrap().clone();
+        let got = find_match(
+            &m,
+            &s,
+            "x:Domain",
+            &body,
+            &MatchKey::Value,
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            got, None,
+            "a populated property the body omits is real drift, not a null"
+        );
+    }
+
+    #[test]
+    fn touched_ids_are_scoped_by_object_type() {
+        let mut state = State {
+            created_ids: HashMap::new(),
+            touched: HashMap::new(),
+            summary: Summary {
+                planned_destroys: 0,
+                planned_updates: 0,
+                planned_creates: 0,
+                planned_create_objects: 0,
+                planned_upserts: 0,
+                planned_upsert_objects: 0,
+                planned_reconciles: 0,
+                planned_reconcile_objects: 0,
+                destroyed: 0,
+                updated: 0,
+                created: 0,
+                failed: 0,
+            },
+        };
+        state.touch("x:Domain", "b");
+        assert!(state.is_touched("x:Domain", "b"));
+        assert!(
+            !state.is_touched("x:Account", "b"),
+            "ids are only unique within a type; a matched Domain must not shield an Account \
+             that happens to share its id from a reconcile's cleanup"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_top_level_key_is_rejected() {
+        let input = "{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+                     \"scoep\":{\"@type\":\"Local\"},\"value\":{}}\n";
+        let err = match parse_ndjson_plan(input) {
+            Ok(_) => panic!("expected an unknown key to be rejected"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            err.contains("scoep"),
+            "a misspelled `scope` would silently widen a reconcile to the whole type: {err}"
+        );
+    }
+
+    #[test]
+    fn scope_on_a_non_variant_at_type_is_rejected() {
+        let s = mta_route_multi_schema_with_fields();
+        let raw = vec![RawOp::Reconcile {
+            object: "MtaRoute".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "@type": "Loacl" })),
+            value: Map::new(),
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected a bogus @type scope to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a variant") && msg.contains("Local"),
+            "a typo'd variant name selects nothing, which is indistinguishable from a \
+             successful reconcile: {msg}"
+        );
+    }
+
+    #[test]
+    fn scope_on_at_type_requires_a_multi_variant_type() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Domain".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "@type": "Local" })),
+            value: Map::new(),
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected an @type scope on a single-variant type to be rejected"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("not a multi-variant type"));
+    }
+
+    #[test]
+    fn an_entry_inherits_the_scope_it_omits() {
+        let scope = vec![("namespace".to_string(), json!("traps"))];
+        let body = json!({ "key": "foo@*" }).as_object().unwrap().clone();
+        let merged = scoped_body(&body, Some(&scope));
+        assert_eq!(
+            merged.get("namespace"),
+            Some(&json!("traps")),
+            "an omitted scope property must be filled in, or the created object lands outside \
+             the scope and is created again on every apply"
+        );
+        assert_eq!(merged.get("key"), Some(&json!("foo@*")));
+    }
+
+    #[test]
+    fn an_entry_keeps_its_own_value_for_a_scoped_property() {
+        let scope = vec![("namespace".to_string(), json!("traps"))];
+        let body = json!({ "key": "foo@*", "namespace": "traps" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let merged = scoped_body(&body, Some(&scope));
+        assert!(
+            matches!(merged, std::borrow::Cow::Borrowed(_)),
+            "a body that already sets every scope property must not be cloned"
+        );
+    }
+
+    #[test]
+    fn value_matching_rejects_two_identical_entries() {
+        let s = domain_schema();
+        let mut value = Map::new();
+        value.insert("a".into(), json!({ "name": "dup.com" }));
+        value.insert("b".into(), json!({ "name": "dup.com" }));
+        let err = match reject_duplicate_match_keys(
+            &s,
+            "x:Domain",
+            &entries_of(&value, None),
+            &MatchKey::Value,
+            &HashMap::new(),
+            0,
+        ) {
+            Ok(_) => panic!("expected two identical entries to be rejected under value matching"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("identical values"),
+            "both entries would be created, and every later apply would fail as ambiguous: {msg}"
+        );
+    }
+
+    #[test]
+    fn scope_reference_and_literal_id_are_not_a_contradiction() {
+        let s = account_schema();
+        let raw = vec![RawOp::Upsert {
+            object: "Account".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "domainId": "#dom-a" })),
+            value: {
+                let mut m = Map::new();
+                m.insert("acc".into(), json!({ "name": "a", "domainId": "srv-dom" }));
+                m
+            },
+        }];
+        Plan::resolve(&s, raw).expect(
+            "a `#ref` and a literal id may denote the same object; only the run time knows, \
+             so plan time must not call it a contradiction",
+        );
+    }
+
+    #[test]
+    fn an_entry_outside_its_own_scope_is_rejected() {
+        let s = account_schema();
+        let raw = vec![RawOp::Upsert {
+            object: "Account".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "domainId": "#dom-a" })),
+            value: {
+                let mut m = Map::new();
+                m.insert("in".into(), json!({ "name": "a", "domainId": "#dom-a" }));
+                m.insert("out".into(), json!({ "name": "b", "domainId": "#dom-b" }));
+                m
+            },
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected an out-of-scope entry to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside its own `scope`") && msg.contains("out"),
+            "an out-of-scope entry can never match, so it would be recreated on every apply: \
+             {msg}"
+        );
+    }
+
+    #[test]
+    fn an_entry_that_omits_a_scoped_property_is_allowed() {
+        let s = account_schema();
+        let raw = vec![RawOp::Upsert {
+            object: "Account".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "domainId": "#dom-a" })),
+            value: {
+                let mut m = Map::new();
+                m.insert("a".into(), json!({ "name": "a" }));
+                m
+            },
+        }];
+        Plan::resolve(&s, raw).expect(
+            "a body that omits the scoped property may still be in scope once the server \
+             applies its defaults, so the check only compares what the body sets",
+        );
+    }
+
+    #[test]
+    fn scope_narrows_the_leak_set_to_the_slice_the_op_owns() {
         let m = matcher_for(
-            "x:MtaRoute",
+            "x:MemoryLookupKey",
             vec![
-                json!({ "id": "l1", "@type": "Local", "name": "a" }),
-                json!({ "id": "x1", "name": "no-type" }),
+                json!({ "id": "k1", "namespace": "traps", "key": "a" }),
+                json!({ "id": "k2", "namespace": "other", "key": "b" }),
             ],
         );
         let outcome = UpsertOutcome {
             created: 0,
             updated: 0,
             matched_ids: HashSet::new(),
-            plan_at_types: ["Local".to_string()].into_iter().collect(),
+            scope: Some(vec![("namespace".to_string(), json!("traps"))]),
         };
-        let leaked = leaked_ids(&s, "x:MtaRoute", &m, &outcome);
         assert_eq!(
-            leaked,
-            vec!["l1".to_string()],
-            "a candidate with no @type must never be leaked by a multi-variant reconcile"
+            leaked_ids(&m, "x:MemoryLookupKey", &outcome),
+            vec!["k1".to_string()],
+            "an object outside the scope is not the operation's to delete"
         );
     }
 
     #[test]
-    fn leaked_ids_multi_variant_empty_plan_deletes_nothing() {
-        let s = mta_route_multi_schema();
+    fn scope_reference_may_not_point_at_the_op_that_declares_it() {
+        let s = account_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Account".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "domainId": "#self" })),
+            value: {
+                let mut m = Map::new();
+                m.insert("self".into(), json!({ "name": "a", "domainId": "#self" }));
+                m
+            },
+        }];
+        let plan = Plan::resolve(&s, raw).expect("plan resolves structurally");
+        let err = match validate_plan_references(&s, &plan) {
+            Ok(_) => panic!("expected a self-referencing scope to be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("#self"),
+            "a scope is resolved before the operation creates anything, so dry-run must \
+             reject what the real run cannot resolve: {err}"
+        );
+    }
+
+    #[test]
+    fn scope_with_a_null_value_is_rejected() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Domain".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "description": Value::Null })),
+            value: Map::new(),
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected a null scope value to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("null `scope` value") && msg.contains("widen"),
+            "a null scope value matches every object that omits the property, which would \
+             widen the operation rather than narrow it: {msg}"
+        );
+    }
+
+    #[test]
+    fn scope_on_an_unknown_property_is_rejected() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Domain".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "nameContains": "spam-" })),
+            value: Map::new(),
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected an unknown scope property to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a property") && msg.contains("Contains"),
+            "an operator-form filter key silently matches nothing, so it must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn scope_accepts_at_type_and_declared_properties() {
+        let s = mta_route_multi_schema_with_fields();
+        let raw = vec![RawOp::Reconcile {
+            object: "MtaRoute".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "@type": "Local", "name": "a" })),
+            value: Map::new(),
+        }];
+        Plan::resolve(&s, raw)
+            .expect("`@type` and a property declared by any variant are both valid filter keys");
+    }
+
+    #[test]
+    fn value_match_rejects_an_ambiguous_candidate_set() {
+        let s = domain_schema();
+        let m = matcher_with(vec![
+            json!({ "id": "srv1", "name": "a.com", "description": Value::Null }),
+            json!({ "id": "srv2", "name": "a.com", "description": Value::Null }),
+        ]);
+        let body = json!({ "name": "a.com" }).as_object().unwrap().clone();
+        let err = match find_match(
+            &m,
+            &s,
+            "x:Domain",
+            &body,
+            &MatchKey::Value,
+            None,
+            &HashMap::new(),
+        ) {
+            Ok(_) => panic!("expected an ambiguous value match to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ambiguous match"),
+            "picking the first of several identical candidates would silently destroy the rest \
+             under reconcile: {msg}"
+        );
+    }
+
+    #[test]
+    fn props_match_treats_an_absent_property_as_null() {
+        let s = account_schema();
+        let m = matcher_for(
+            "x:Account",
+            vec![json!({ "id": "srv1", "name": "a", "domainId": Value::Null })],
+        );
+        let body = json!({ "name": "a", "domainId": Value::Null })
+            .as_object()
+            .unwrap()
+            .clone();
+        let key = MatchKey::Props(vec!["name".into(), "domainId".into()]);
+        let got = find_match(&m, &s, "x:Account", &body, &key, None, &HashMap::new()).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("srv1"),
+            "both match branches must agree on null handling"
+        );
+    }
+
+    #[test]
+    fn scope_is_rejected_on_create_update_and_destroy() {
+        for op in ["create", "update", "destroy"] {
+            let input = format!(
+                "{{\"@type\":\"{op}\",\"object\":\"Domain\",\"scope\":{{\"name\":\"a\"}},\
+                 \"value\":{{\"d1\":{{\"name\":\"a\"}}}}}}\n"
+            );
+            let raw = parse_ndjson_plan(&input).expect("the op parses");
+            let err = match Plan::resolve(&domain_schema(), raw) {
+                Ok(_) => panic!("expected a scope on `{op}` to be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                format!("{err}").contains("only upsert and reconcile match"),
+                "a scope on `{op}` must not be silently ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_match_on_reports_the_offending_value() {
+        for (input, expected) in [
+            (
+                "{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":5,\"value\":{}}",
+                "integer",
+            ),
+            (
+                "{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"a\",2],\"value\":{}}",
+                "expected a string",
+            ),
+            (
+                "{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":{},\"value\":{}}",
+                "a list of property names",
+            ),
+        ] {
+            let err = match parse_ndjson_plan(input) {
+                Ok(_) => panic!("expected a malformed matchOn to be rejected: {input}"),
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                err.contains(expected) && !err.contains("untagged"),
+                "expected a message naming the offending value, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_match_on_is_accepted_on_an_upsert() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Upsert {
+            object: "Domain".into(),
+            match_on: Some(MatchOn::Wildcard("*".into())),
+            scope: None,
+            value: {
+                let mut m = Map::new();
+                m.insert("d1".into(), json!({ "name": "a.com" }));
+                m
+            },
+        }];
+        Plan::resolve(&s, raw).expect("an upsert may opt into value matching explicitly");
+    }
+
+    #[test]
+    fn reconcile_with_wildcard_match_on_opts_into_value_matching() {
+        let mut s = Schema::default();
+        s.objects.insert("x:Tracer".into(), obj_type());
+        let raw = vec![RawOp::Reconcile {
+            object: "Tracer".into(),
+            match_on: Some(MatchOn::Wildcard("*".into())),
+            scope: None,
+            value: {
+                let mut m = Map::new();
+                m.insert("t1".into(), json!({ "name": "x" }));
+                m
+            },
+        }];
+        let plan = Plan::resolve(&s, raw)
+            .expect("an explicit wildcard matchOn opts into value matching on a keyless type");
+        assert_eq!(plan.reconciles, 1);
+    }
+
+    #[test]
+    fn wildcard_match_on_resolves_to_value_matching() {
+        let s = domain_schema();
+        assert!(
+            matches!(
+                resolve_match_key(&s, "x:Domain", Some(&MatchOn::Wildcard("*".into()))),
+                MatchKey::Value
+            ),
+            "an explicit wildcard must override the label property"
+        );
+    }
+
+    #[test]
+    fn non_wildcard_match_on_string_is_rejected() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Domain".into(),
+            match_on: Some(MatchOn::Wildcard("all".into())),
+            scope: None,
+            value: Map::new(),
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected an error for a matchOn string other than `*`"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("invalid `matchOn` value"));
+    }
+
+    #[test]
+    fn parses_match_on_wildcard_and_scope() {
+        let input = "{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":\"*\",\
+                     \"scope\":{\"@type\":\"Local\"},\"value\":{}}\n";
+        let ops = parse_ndjson_plan(input).unwrap();
+        match &ops[0] {
+            RawOp::Reconcile {
+                match_on, scope, ..
+            } => {
+                assert!(matches!(match_on, Some(MatchOn::Wildcard(w)) if w == "*"));
+                assert_eq!(
+                    scope.as_ref().and_then(|s| s.get("@type")),
+                    Some(&json!("Local"))
+                );
+            }
+            other => panic!("expected reconcile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_restricts_which_candidates_an_upsert_may_match() {
+        let s = account_schema();
+        let m = matcher_for(
+            "x:Account",
+            vec![
+                json!({ "id": "in", "name": "shared", "domainId": "dom-1" }),
+                json!({ "id": "out", "name": "shared", "domainId": "dom-2" }),
+            ],
+        );
+        let body = json!({ "name": "shared", "domainId": "dom-1" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let key = MatchKey::Props(vec!["name".into()]);
+
+        let err = find_match(&m, &s, "x:Account", &body, &key, None, &HashMap::new())
+            .expect_err("without a scope both domains are candidates and the match is ambiguous");
+        assert!(format!("{err}").contains("ambiguous"));
+
+        let scope = vec![("domainId".to_string(), json!("dom-1"))];
+        let got = find_match(
+            &m,
+            &s,
+            "x:Account",
+            &body,
+            &key,
+            Some(&scope),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("in"),
+            "a scope keeps an operation from reaching across into a slice it does not own"
+        );
+    }
+
+    #[test]
+    fn scope_must_be_an_object() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Domain".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!("Local")),
+            value: Map::new(),
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected an error for a non-object scope"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("not a JSON object"));
+    }
+
+    #[test]
+    fn empty_scope_is_treated_as_absent() {
+        let s = domain_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Domain".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({})),
+            value: Map::new(),
+        }];
+        let plan = Plan::resolve(&s, raw).expect("an empty scope resolves");
+        assert!(
+            matches!(&plan.ops[0], ResolvedOp::Reconcile { scope: None, .. }),
+            "an empty scope must not narrow the operation"
+        );
+    }
+
+    #[test]
+    fn scope_resolves_a_client_reference() {
+        let s = account_schema();
+        let mut created = HashMap::new();
+        created.insert("dom-a".to_string(), "srv-dom".to_string());
+        let filter = json!({ "domainId": "#dom-a" }).as_object().unwrap().clone();
+        let resolved = resolve_scope(&s, "x:Account", &filter, &created)
+            .expect("a declared reference resolves");
+        assert_eq!(
+            resolved,
+            vec![("domainId".to_string(), json!("srv-dom"))],
+            "a reference in a scope resolves to the server id before comparison"
+        );
+    }
+
+    #[test]
+    fn scope_keeps_a_literal_hash_in_a_non_reference_field() {
+        let s = account_schema();
+        let filter = json!({ "name": "#literal" }).as_object().unwrap().clone();
+        let resolved = resolve_scope(&s, "x:Account", &filter, &HashMap::new())
+            .expect("a `#` in a String field is a literal, not a reference");
+        assert_eq!(resolved, vec![("name".to_string(), json!("#literal"))]);
+    }
+
+    #[test]
+    fn scope_unresolved_reference_is_rejected_upfront() {
+        let s = account_schema();
+        let raw = vec![RawOp::Reconcile {
+            object: "Account".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "domainId": "#ghost" })),
+            value: {
+                let mut m = Map::new();
+                m.insert("acc".into(), json!({ "name": "a" }));
+                m
+            },
+        }];
+        let plan = Plan::resolve(&s, raw).expect("plan resolves structurally");
+        let err = match validate_plan_references(&s, &plan) {
+            Ok(_) => panic!("expected an unresolved scope reference to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`scope`") && msg.contains("#ghost"),
+            "expected an unresolved scope reference error: {msg}"
+        );
+    }
+
+    #[test]
+    fn leaked_ids_multi_variant_leaks_every_variant_without_a_filter() {
+        let m = matcher_for(
+            "x:MtaRoute",
+            vec![
+                json!({ "id": "l1", "@type": "Local", "name": "a" }),
+                json!({ "id": "m1", "@type": "Mx", "name": "b" }),
+                json!({ "id": "x1", "name": "no-type" }),
+            ],
+        );
+        let outcome = UpsertOutcome {
+            created: 0,
+            updated: 1,
+            matched_ids: ["l1".to_string()].into_iter().collect(),
+            scope: None,
+        };
+        let mut leaked = leaked_ids(&m, "x:MtaRoute", &outcome);
+        leaked.sort();
+        assert_eq!(
+            leaked,
+            vec!["m1".to_string(), "x1".to_string()],
+            "an unfiltered reconcile converges the whole type, not just the variants it names"
+        );
+    }
+
+    #[test]
+    fn leaked_ids_multi_variant_empty_plan_deletes_everything() {
         let m = matcher_for(
             "x:MtaRoute",
             vec![
@@ -2568,12 +3744,66 @@ mod tests {
             created: 0,
             updated: 0,
             matched_ids: HashSet::new(),
-            plan_at_types: HashSet::new(),
+            scope: None,
         };
-        let leaked = leaked_ids(&s, "x:MtaRoute", &m, &outcome);
-        assert!(
-            leaked.is_empty(),
-            "an empty-value reconcile on a multi-variant type must delete nothing"
+        let mut leaked = leaked_ids(&m, "x:MtaRoute", &outcome);
+        leaked.sort();
+        assert_eq!(
+            leaked,
+            vec!["l1".to_string(), "m1".to_string()],
+            "an empty-value reconcile deletes the whole type regardless of variant count"
+        );
+    }
+
+    #[test]
+    fn leaked_ids_scope_restricts_deletion_to_one_variant() {
+        let m = matcher_for(
+            "x:MtaRoute",
+            vec![
+                json!({ "id": "l1", "@type": "Local", "name": "a" }),
+                json!({ "id": "l2", "@type": "Local", "name": "b" }),
+                json!({ "id": "m1", "@type": "Mx", "name": "c" }),
+                json!({ "id": "x1", "name": "no-type" }),
+            ],
+        );
+        let outcome = UpsertOutcome {
+            created: 0,
+            updated: 1,
+            matched_ids: ["l1".to_string()].into_iter().collect(),
+            scope: Some(vec![("@type".to_string(), json!("Local"))]),
+        };
+        let leaked = leaked_ids(&m, "x:MtaRoute", &outcome);
+        assert_eq!(
+            leaked,
+            vec!["l2".to_string()],
+            "only unmatched candidates inside the operation's scope are destroyed"
+        );
+    }
+
+    #[test]
+    fn leaked_ids_scope_requires_every_property_to_match() {
+        let m = matcher_for(
+            "x:MemoryLookupKey",
+            vec![
+                json!({ "id": "k1", "namespace": "traps", "isGlobPattern": true }),
+                json!({ "id": "k2", "namespace": "traps", "isGlobPattern": false }),
+                json!({ "id": "k3", "namespace": "other", "isGlobPattern": true }),
+            ],
+        );
+        let outcome = UpsertOutcome {
+            created: 0,
+            updated: 0,
+            matched_ids: HashSet::new(),
+            scope: Some(vec![
+                ("namespace".to_string(), json!("traps")),
+                ("isGlobPattern".to_string(), json!(true)),
+            ]),
+        };
+        let leaked = leaked_ids(&m, "x:MemoryLookupKey", &outcome);
+        assert_eq!(
+            leaked,
+            vec!["k1".to_string()],
+            "a compound scope is an AND over every property"
         );
     }
 
@@ -2582,7 +3812,8 @@ mod tests {
         let s = account_schema();
         let raw = vec![RawOp::Upsert {
             object: "Account".into(),
-            match_on: Some(vec!["name".into()]),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: None,
             value: {
                 let mut m = Map::new();
                 m.insert("acc".into(), json!({ "@type": "User", "name": "#literal" }));
@@ -2595,31 +3826,6 @@ mod tests {
     }
 
     #[test]
-    fn leaked_ids_multi_variant_only_touches_mentioned_types() {
-        let s = mta_route_multi_schema();
-        let m = matcher_for(
-            "x:MtaRoute",
-            vec![
-                json!({ "id": "l1", "@type": "Local", "name": "a" }),
-                json!({ "id": "l2", "@type": "Local", "name": "b" }),
-                json!({ "id": "m1", "@type": "Mx", "name": "c" }),
-            ],
-        );
-        let outcome = UpsertOutcome {
-            created: 0,
-            updated: 1,
-            matched_ids: ["l1".to_string()].into_iter().collect(),
-            plan_at_types: ["Local".to_string()].into_iter().collect(),
-        };
-        let leaked = leaked_ids(&s, "x:MtaRoute", &m, &outcome);
-        assert_eq!(
-            leaked,
-            vec!["l2".to_string()],
-            "only the unmatched Local is leaked; the Mx variant is not mentioned so it is left alone"
-        );
-    }
-
-    #[test]
     fn record_created_makes_a_later_match_succeed() {
         let s = domain_schema();
         let mut m = matcher_with(vec![]);
@@ -2627,7 +3833,7 @@ mod tests {
         let body = json!({ "name": "a.com" }).as_object().unwrap().clone();
 
         assert_eq!(
-            find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new()).unwrap(),
+            find_match(&m, &s, "x:Domain", &body, &key, None, &HashMap::new()).unwrap(),
             None,
             "nothing exists yet"
         );
@@ -2643,7 +3849,7 @@ mod tests {
         );
 
         assert_eq!(
-            find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new())
+            find_match(&m, &s, "x:Domain", &body, &key, None, &HashMap::new())
                 .unwrap()
                 .as_deref(),
             Some("srv9"),
@@ -2680,7 +3886,7 @@ mod tests {
         let key = resolve_match_key(&s, "x:Domain", None);
         let body = json!({ "name": "new.com" }).as_object().unwrap().clone();
         assert_eq!(
-            find_match(&m, &s, "x:Domain", &body, &key, &HashMap::new())
+            find_match(&m, &s, "x:Domain", &body, &key, None, &HashMap::new())
                 .unwrap()
                 .as_deref(),
             Some("srv1"),
@@ -2739,13 +3945,24 @@ mod tests {
     #[test]
     fn duplicate_match_keys_in_one_op_are_rejected() {
         let s = domain_schema();
-        let key = resolve_match_key(&s, "x:Domain", Some(&["name".to_string()]));
+        let key = resolve_match_key(
+            &s,
+            "x:Domain",
+            Some(&MatchOn::Props(vec!["name".to_string()])),
+        );
         let mut value = Map::new();
         value.insert("a".into(), json!({ "name": "dup.com" }));
         value.insert("b".into(), json!({ "name": "dup.com" }));
 
-        let err = reject_duplicate_match_keys(&s, "x:Domain", &value, &key, &HashMap::new(), 2)
-            .unwrap_err();
+        let err = reject_duplicate_match_keys(
+            &s,
+            "x:Domain",
+            &entries_of(&value, None),
+            &key,
+            &HashMap::new(),
+            2,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("operation #3"), "message names the op: {msg}");
         assert!(
@@ -2762,35 +3979,136 @@ mod tests {
         let mut value = Map::new();
         value.insert("a".into(), json!({ "name": "a.com" }));
         value.insert("b".into(), json!({ "name": "b.com" }));
-        reject_duplicate_match_keys(&s, "x:Domain", &value, &key, &HashMap::new(), 0)
-            .expect("distinct keys are fine");
+        reject_duplicate_match_keys(
+            &s,
+            "x:Domain",
+            &entries_of(&value, None),
+            &key,
+            &HashMap::new(),
+            0,
+        )
+        .expect("distinct keys are fine");
     }
 
     #[test]
-    fn duplicate_check_is_skipped_for_value_fallback_matching() {
+    fn duplicate_check_needs_field_metadata_to_compare_values() {
         let mut bare = Schema::default();
         bare.objects.insert("x:Tracer".into(), obj_type());
         let key = resolve_match_key(&bare, "x:Tracer", None);
         let mut value = Map::new();
         value.insert("a".into(), json!({ "name": "same" }));
         value.insert("b".into(), json!({ "name": "same" }));
-        reject_duplicate_match_keys(&bare, "x:Tracer", &value, &key, &HashMap::new(), 0)
-            .expect("value-fallback matching already warns; it is not key-based");
+        reject_duplicate_match_keys(
+            &bare,
+            "x:Tracer",
+            &entries_of(&value, None),
+            &key,
+            &HashMap::new(),
+            0,
+        )
+        .expect("with no declared fields there is nothing to compare; find_match reports it");
+    }
+
+    #[test]
+    fn duplicate_check_sees_entries_that_only_match_after_inheriting_the_scope() {
+        let s = lookup_key_schema();
+        let scope = vec![("namespace".to_string(), json!("traps"))];
+        let mut value = Map::new();
+        value.insert("a".into(), json!({ "key": "foo@*" }));
+        value.insert("b".into(), json!({ "key": "foo@*" }));
+        let key = MatchKey::Props(vec!["namespace".into(), "key".into()]);
+        let err = match reject_duplicate_match_keys(
+            &s,
+            "x:MemoryLookupKey",
+            &entries_of(&value, Some(&scope)),
+            &key,
+            &HashMap::new(),
+            0,
+        ) {
+            Ok(_) => panic!("expected two entries sharing an inherited match key to be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("same match key"),
+            "both entries inherit `namespace` from the scope, so they collide; checking the \
+             un-inherited bodies would skip them and create a duplicate: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_check_sees_a_stated_and_an_inherited_scope_value_as_equal() {
+        let s = lookup_key_schema();
+        let scope = vec![("namespace".to_string(), json!("traps"))];
+        let mut value = Map::new();
+        value.insert("a".into(), json!({ "key": "foo@*" }));
+        value.insert("b".into(), json!({ "namespace": "traps", "key": "foo@*" }));
+        let err = reject_duplicate_match_keys(
+            &s,
+            "x:MemoryLookupKey",
+            &entries_of(&value, Some(&scope)),
+            &MatchKey::Value,
+            &HashMap::new(),
+            0,
+        )
+        .expect_err("spelling the scope out must not hide a duplicate under value matching");
+        assert!(format!("{err}").contains("identical values"), "{err}");
+    }
+
+    #[test]
+    fn scope_on_a_server_set_property_is_rejected() {
+        let s = server_set_scope_schema();
+        let raw = vec![RawOp::Upsert {
+            object: "Cert".into(),
+            match_on: Some(MatchOn::Props(vec!["name".into()])),
+            scope: Some(json!({ "fingerprint": "abc" })),
+            value: {
+                let mut m = Map::new();
+                m.insert("c".into(), json!({ "name": "a" }));
+                m
+            },
+        }];
+        let err = match Plan::resolve(&s, raw) {
+            Ok(_) => panic!("expected a scope on a server-derived property to be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("which the server derives"),
+            "an entry cannot be created into a ServerSet scope, so it would be recreated on \
+             every apply: {err}"
+        );
     }
 
     #[test]
     fn duplicate_check_separates_variants_of_a_multi_variant_type() {
         let s = mta_route_multi_schema();
-        let key = resolve_match_key(&s, "x:MtaRoute", Some(&["name".to_string()]));
+        let key = resolve_match_key(
+            &s,
+            "x:MtaRoute",
+            Some(&MatchOn::Props(vec!["name".to_string()])),
+        );
         let mut value = Map::new();
         value.insert("a".into(), json!({ "@type": "Local", "name": "same" }));
         value.insert("b".into(), json!({ "@type": "Mx", "name": "same" }));
-        reject_duplicate_match_keys(&s, "x:MtaRoute", &value, &key, &HashMap::new(), 0)
-            .expect("the same name under two variants is not the same object");
+        reject_duplicate_match_keys(
+            &s,
+            "x:MtaRoute",
+            &entries_of(&value, None),
+            &key,
+            &HashMap::new(),
+            0,
+        )
+        .expect("the same name under two variants is not the same object");
 
         value.insert("c".into(), json!({ "@type": "Local", "name": "same" }));
-        reject_duplicate_match_keys(&s, "x:MtaRoute", &value, &key, &HashMap::new(), 0)
-            .expect_err("two Local routes with the same name collide");
+        reject_duplicate_match_keys(
+            &s,
+            "x:MtaRoute",
+            &entries_of(&value, None),
+            &key,
+            &HashMap::new(),
+            0,
+        )
+        .expect_err("two Local routes with the same name collide");
     }
 
     #[test]
@@ -2799,7 +4117,10 @@ mod tests {
         let key = resolve_match_key(
             &s,
             "x:Account",
-            Some(&["name".to_string(), "domainId".to_string()]),
+            Some(&MatchOn::Props(vec![
+                "name".to_string(),
+                "domainId".to_string(),
+            ])),
         );
         let mut created = HashMap::new();
         created.insert("dom-a".to_string(), "srv-dom".to_string());
@@ -2813,8 +4134,15 @@ mod tests {
             "acc2".into(),
             json!({ "name": "jane", "domainId": "srv-dom" }),
         );
-        let err =
-            reject_duplicate_match_keys(&s, "x:Account", &value, &key, &created, 0).unwrap_err();
+        let err = reject_duplicate_match_keys(
+            &s,
+            "x:Account",
+            &entries_of(&value, None),
+            &key,
+            &created,
+            0,
+        )
+        .unwrap_err();
         assert!(
             format!("{err}").contains("same match key"),
             "a `#ref` and the server id it resolves to are the same key"
@@ -2824,15 +4152,25 @@ mod tests {
     #[test]
     fn duplicate_check_defers_entries_it_cannot_resolve_yet() {
         let s = account_schema();
-        let key = resolve_match_key(&s, "x:Account", Some(&["domainId".to_string()]));
+        let key = resolve_match_key(
+            &s,
+            "x:Account",
+            Some(&MatchOn::Props(vec!["domainId".to_string()])),
+        );
         let mut value = Map::new();
         value.insert(
             "acc1".into(),
             json!({ "name": "jane", "domainId": "#later" }),
         );
         value.insert("acc2".into(), json!({ "name": "john" }));
-        reject_duplicate_match_keys(&s, "x:Account", &value, &key, &HashMap::new(), 0).expect(
-            "unresolved references and missing match properties stay `find_match`'s to report",
-        );
+        reject_duplicate_match_keys(
+            &s,
+            "x:Account",
+            &entries_of(&value, None),
+            &key,
+            &HashMap::new(),
+            0,
+        )
+        .expect("unresolved references and missing match properties stay `find_match`'s to report");
     }
 }

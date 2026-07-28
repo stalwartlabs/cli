@@ -1097,7 +1097,7 @@ fn dry_run_rejects_unresolved_match_reference() {
 }
 
 #[test]
-fn reconcile_converges_and_scopes_deletes_per_variant() {
+fn reconcile_without_a_filter_converges_every_variant() {
     require_server!();
     let _serial = serial();
     let suffix = unique_suffix();
@@ -1167,8 +1167,9 @@ fn reconcile_converges_and_scopes_deletes_per_variant() {
         "the dropped Local route must be gone"
     );
     assert!(
-        id_with("MtaRoute", "name", &mx).is_some(),
-        "the Mx variant is absent from the plan's @types and must be left untouched"
+        id_with("MtaRoute", "name", &mx).is_none(),
+        "an unfiltered reconcile converges the whole type, so the unmentioned Mx variant \
+         is destroyed too"
     );
 
     let (c3, _u3, d3, f3) = apply_summary(&converge);
@@ -1309,7 +1310,7 @@ fn reconcile_creates_and_deletes_in_one_op() {
 }
 
 #[test]
-fn reconcile_multi_variant_empty_value_deletes_nothing() {
+fn reconcile_multi_variant_empty_value_deletes_everything() {
     require_server!();
     let _serial = serial();
     let suffix = unique_suffix();
@@ -1349,14 +1350,652 @@ fn reconcile_multi_variant_empty_value_deletes_nothing() {
     let empty =
         b"{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{}}\n";
     let (c, _u, d, f) = apply_summary(empty);
-    assert_eq!(
-        (c, d, f),
-        (0, 0, 0),
-        "an empty-value reconcile on a multi-variant type must be a pure no-op (no @types named)"
+    assert_eq!((c, f), (0, 0), "an empty-value reconcile creates nothing");
+    assert!(
+        d >= 2,
+        "an empty-value reconcile on a multi-variant type must delete every variant"
     );
     assert!(
-        id_with("MtaRoute", "name", &local).is_some() && id_with("MtaRoute", "name", &mx).is_some(),
-        "both variants must survive an empty multi-variant reconcile"
+        id_with("MtaRoute", "name", &local).is_none() && id_with("MtaRoute", "name", &mx).is_none(),
+        "no variant may survive an empty unfiltered reconcile"
+    );
+}
+
+#[test]
+fn reconcile_scope_restricts_deletes_to_one_variant() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let keep = format!("rcdf-k-{suffix}.test");
+    let drop = format!("rcdf-d-{suffix}.test");
+    let mx = format!("rcdf-m-{suffix}.test");
+    let _gk = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: keep.clone(),
+    };
+    let _gd = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: drop.clone(),
+    };
+    let _gm = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: mx.clone(),
+    };
+
+    let seed = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"k\":{{\"@type\":\"Local\",\"name\":\"{keep}\"}},\
+         \"d\":{{\"@type\":\"Local\",\"name\":\"{drop}\"}}}}}}\n"
+    )
+    .into_bytes();
+    assert_eq!(apply_summary(&seed).3, 0, "seed must not fail");
+
+    let mx_created = run_args(&[
+        "create",
+        "MtaRoute/Mx",
+        "--field",
+        &format!("name={mx}"),
+        "--field",
+        "ipLookupStrategy=v4ThenV6",
+        "--field",
+        "maxMultihomed=2",
+        "--field",
+        "maxMxHosts=5",
+    ]);
+    assert_ok(&mx_created, "create an out-of-band Mx route");
+
+    let scoped = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+         \"scope\":{{\"@type\":\"Local\"}},\"value\":{{\
+         \"k\":{{\"@type\":\"Local\",\"name\":\"{keep}\"}}}}}}\n"
+    )
+    .into_bytes();
+    let (_c, _u, d, f) = apply_summary(&scoped);
+    assert_eq!(f, 0, "a filtered reconcile must not fail");
+    assert!(d >= 1, "the dropped Local route must be destroyed");
+    assert!(
+        id_with("MtaRoute", "name", &keep).is_some(),
+        "the retained Local route must remain"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &drop).is_none(),
+        "the dropped Local route must be gone"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &mx).is_some(),
+        "the scope covers only Local, so the Mx route must be untouched \
+         (server-side @type filtering is unsupported here, so this must be a client-side filter)"
+    );
+}
+
+#[test]
+fn reconcile_scope_deletes_only_the_scoped_variant_on_an_empty_value() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let local = format!("rcdfe-l-{suffix}.test");
+    let mx = format!("rcdfe-m-{suffix}.test");
+    let _gl = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: local.clone(),
+    };
+    let _gm = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: mx.clone(),
+    };
+
+    let seed = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"l\":{{\"@type\":\"Local\",\"name\":\"{local}\"}}}}}}\n"
+    )
+    .into_bytes();
+    assert_eq!(apply_summary(&seed).3, 0, "seed must not fail");
+    let mx_created = run_args(&[
+        "create",
+        "MtaRoute/Mx",
+        "--field",
+        &format!("name={mx}"),
+        "--field",
+        "ipLookupStrategy=v4ThenV6",
+        "--field",
+        "maxMultihomed=2",
+        "--field",
+        "maxMxHosts=5",
+    ]);
+    assert_ok(&mx_created, "create Mx route");
+
+    let wipe_mx = b"{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+                    \"scope\":{\"@type\":\"Mx\"},\"value\":{}}\n";
+    let (c, _u, d, f) = apply_summary(wipe_mx);
+    assert_eq!((c, f), (0, 0), "the wipe must create nothing and not fail");
+    assert!(d >= 1, "every Mx route must be destroyed");
+    assert!(
+        id_with("MtaRoute", "name", &mx).is_none(),
+        "the filtered variant must be deleted by an empty-value reconcile"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &local).is_some(),
+        "the unfiltered variant must survive"
+    );
+}
+
+#[test]
+fn reconcile_wildcard_match_on_is_accepted_on_a_keyless_type() {
+    require_server!();
+    let plan = b"{\"@type\":\"reconcile\",\"object\":\"Tracer\",\"matchOn\":\"*\",\
+                 \"value\":{\"t\":{\"@type\":\"Stdout\"}}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert_ok(
+        &out,
+        "an explicit `matchOn: \"*\"` opts into value matching on a type with no label property",
+    );
+}
+
+#[test]
+fn reconcile_wildcard_match_on_converges_to_a_single_object() {
+    require_server!();
+    let _serial = serial();
+    let name = format!("rcw-{}.test", unique_suffix());
+    let _g = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: name.clone(),
+    };
+
+    let plan = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":\"*\",\"value\":{{\
+         \"r\":{{\"@type\":\"Local\",\"name\":\"{name}\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (c1, _u1, _d1, f1) = apply_summary(&plan);
+    assert_eq!(
+        (c1, f1),
+        (1, 0),
+        "a wildcard reconcile must create the route"
+    );
+
+    let (_c2, _u2, _d2, f2) = apply_summary(&plan);
+    assert_eq!(f2, 0, "re-applying a wildcard reconcile must not fail");
+    assert_eq!(
+        ids_with("MtaRoute", "name", &name).len(),
+        1,
+        "value matching must converge to exactly one object, never accumulate duplicates"
+    );
+}
+
+#[test]
+fn reconcile_then_upsert_of_the_same_type_keeps_the_upserted_objects() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let local = format!("rcru-l-{suffix}.test");
+    let mx = format!("rcru-m-{suffix}.test");
+    let _gl = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: local.clone(),
+    };
+    let _gm = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: mx.clone(),
+    };
+
+    let mx_created = run_args(&[
+        "create",
+        "MtaRoute/Mx",
+        "--field",
+        &format!("name={mx}"),
+        "--field",
+        "ipLookupStrategy=v4ThenV6",
+        "--field",
+        "maxMultihomed=2",
+        "--field",
+        "maxMxHosts=5",
+    ]);
+    assert_ok(&mx_created, "create the route the later op will claim");
+
+    let plan = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"l\":{{\"@type\":\"Local\",\"name\":\"{local}\"}}}}}}\n\
+         {{\"@type\":\"upsert\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"m\":{{\"@type\":\"Mx\",\"name\":\"{mx}\",\"ipLookupStrategy\":\"v4ThenV6\",\
+         \"maxMultihomed\":2,\"maxMxHosts\":5}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (_c, _u, _d, f) = apply_summary(&plan);
+    assert_eq!(f, 0, "the plan must not fail");
+    assert!(
+        id_with("MtaRoute", "name", &mx).is_some(),
+        "the reconcile marked the Mx route as leaked before the upsert claimed it; the deferred \
+         cleanup must not destroy what a later operation matched"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &local).is_some(),
+        "the reconciled Local route must exist"
+    );
+}
+
+#[test]
+fn two_reconciles_of_one_type_do_not_double_destroy() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let a = format!("rcdd-a-{suffix}.test");
+    let b = format!("rcdd-b-{suffix}.test");
+    let stale = format!("rcdd-s-{suffix}.test");
+    let _ga = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: a.clone(),
+    };
+    let _gb = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: b.clone(),
+    };
+    let _gs = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: stale.clone(),
+    };
+
+    let seed = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"s\":{{\"@type\":\"Local\",\"name\":\"{stale}\"}}}}}}\n"
+    )
+    .into_bytes();
+    assert_eq!(apply_summary(&seed).3, 0, "seed must not fail");
+
+    let plan = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}}}}}}\n\
+         {{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"b\":{{\"@type\":\"Local\",\"name\":\"{b}\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (_c, _u, _d, f) = apply_summary(&plan);
+    assert_eq!(
+        f, 0,
+        "both reconciles leak the same stale route; destroying it twice must not fail the run"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &stale).is_none(),
+        "the stale route must be destroyed once"
+    );
+    assert!(
+        id_with("MtaRoute", "name", &a).is_some() && id_with("MtaRoute", "name", &b).is_some(),
+        "neither reconcile may destroy what the other created"
+    );
+}
+
+#[test]
+fn reconcile_scope_resolves_a_reference_from_an_earlier_op() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let owned = format!("rcref-o-{suffix}.test");
+    let other = format!("rcref-x-{suffix}.test");
+
+    let owned_id = create_domain(&owned);
+    let _owned_tree = DomainTree(owned_id.clone());
+    let other_id = create_domain(&other);
+    let _other_tree = DomainTree(other_id.clone());
+
+    let stale = format!("stale-{suffix}");
+    let untouched = format!("untouched-{suffix}");
+    create_account_user(&stale, &owned_id);
+    create_account_user(&untouched, &other_id);
+
+    let kept = format!("kept-{suffix}");
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"dom-a\":{{\"name\":\"{owned}\"}}}}}}\n\
+         {{\"@type\":\"reconcile\",\"object\":\"Account\",\"matchOn\":[\"name\"],\
+         \"scope\":{{\"domainId\":\"#dom-a\"}},\"value\":{{\
+         \"acc\":{{\"@type\":\"User\",\"name\":\"{kept}\",\"domainId\":\"#dom-a\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (_c, _u, _d, f) = apply_summary(&plan);
+    assert_eq!(f, 0, "the scoped reconcile must not fail");
+    assert!(
+        id_with("Account", "name", &kept).is_some(),
+        "the planned account must exist"
+    );
+    assert!(
+        id_with("Account", "name", &stale).is_none(),
+        "an account in the filtered domain that the plan dropped must be destroyed"
+    );
+    assert!(
+        id_with("Account", "name", &untouched).is_some(),
+        "an account outside the filtered domain must survive; the filter reference must resolve \
+         to the domain's server id, not be compared as the literal `#dom-a`"
+    );
+}
+
+#[test]
+fn upsert_wildcard_match_on_does_not_duplicate_on_re_apply() {
+    require_server!();
+    let _serial = serial();
+    let name = format!("upw-{}.test", unique_suffix());
+    let _g = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: name.clone(),
+    };
+
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"MtaRoute\",\"matchOn\":\"*\",\"value\":{{\
+         \"r\":{{\"@type\":\"Local\",\"name\":\"{name}\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (c1, _u1, _d1, f1) = apply_summary(&plan);
+    assert_eq!((c1, f1), (1, 0), "the first apply creates the route");
+    let (c2, _u2, _d2, f2) = apply_summary(&plan);
+    assert_eq!(
+        (c2, f2),
+        (0, 0),
+        "value matching must match the unchanged object rather than create a second one"
+    );
+    assert_eq!(
+        ids_with("MtaRoute", "name", &name).len(),
+        1,
+        "an upsert must never accumulate duplicates"
+    );
+}
+
+#[test]
+fn reconcile_scope_on_an_unknown_property_is_rejected() {
+    require_server!();
+    let plan = b"{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+                 \"scope\":{\"nameContains\":\"spam-\"},\"value\":{}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "a scope key that is not a property matches nothing, so it must be rejected \
+         rather than silently converge nothing"
+    );
+    assert!(
+        stderr_string(&out).contains("not a property"),
+        "expected an unknown-property rejection: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn reconcile_scope_with_a_null_value_is_rejected() {
+    require_server!();
+    let plan = b"{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+                 \"scope\":{\"description\":null},\"value\":{}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "a null filter value widens the filter to every object that omits the property"
+    );
+    assert!(
+        stderr_string(&out).contains("null `scope` value"),
+        "expected a null-value rejection: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn scope_on_a_create_op_is_rejected() {
+    require_server!();
+    let plan = b"{\"@type\":\"create\",\"object\":\"MtaRoute\",\"scope\":{\"name\":\"a\"},\
+                 \"value\":{\"r\":{\"@type\":\"Local\",\"name\":\"nope.test\"}}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "a scope on a create must be rejected, not silently dropped by serde"
+    );
+    assert!(
+        stderr_string(&out).contains("only upsert and reconcile match"),
+        "expected a scope rejection: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn a_scoped_upsert_is_idempotent_on_a_paginated_type() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let ns = format!("traps-{suffix}");
+    let key = format!("foo-{suffix}@*");
+    let _g = NameGuard {
+        object: "MemoryLookupKey",
+        field: "key",
+        value: key.clone(),
+    };
+
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"MemoryLookupKey\",\"matchOn\":[\"key\"],\
+         \"scope\":{{\"namespace\":\"{ns}\"}},\"value\":{{\
+         \"lk\":{{\"key\":\"{key}\",\"isGlobPattern\":true}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (c1, _u1, _d1, f1) = apply_summary(&plan);
+    assert_eq!(
+        (c1, f1),
+        (1, 0),
+        "the entry omits the scoped property, so the operation must supply it"
+    );
+    assert!(
+        ids_for("MemoryLookupKey").len() > 500,
+        "this test is only meaningful on a type large enough to paginate the match cache"
+    );
+    let ids = ids_with("MemoryLookupKey", "key", &key);
+    assert_eq!(
+        ids.len(),
+        1,
+        "exactly one key must exist after the first apply"
+    );
+    assert_eq!(
+        get_json("MemoryLookupKey", Some(&ids[0]))["namespace"]
+            .as_str()
+            .unwrap_or_default(),
+        ns,
+        "the created object must land inside the scope it was created under"
+    );
+
+    let (c2, _u2, _d2, f2) = apply_summary(&plan);
+    assert_eq!(
+        (c2, f2),
+        (0, 0),
+        "re-applying must match the object it created, not create a second one"
+    );
+    assert_eq!(
+        ids_with("MemoryLookupKey", "key", &key).len(),
+        1,
+        "an object created outside its own scope could never be matched again"
+    );
+}
+
+#[test]
+fn snapshot_covers_every_object_of_a_paginated_type() {
+    require_server!();
+    let _serial = serial();
+    let live = ids_for("MemoryLookupKey");
+    assert!(
+        live.len() > 500,
+        "this test is only meaningful on a type larger than one page"
+    );
+
+    let out = snapshot_output("MemoryLookupKey");
+    assert_ok(&out, "snapshot a paginated type");
+    let emitted: usize = stdout_string(&out)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v.get("value").and_then(|m| m.as_object()).map(|m| m.len()))
+        .sum();
+    assert_eq!(
+        emitted,
+        live.len(),
+        "a snapshot that stops at the first page produces a plan that looks complete but \
+         restores only part of the type"
+    );
+}
+
+#[test]
+fn destroy_removes_every_object_of_a_paginated_type() {
+    require_server!();
+    let _serial = serial();
+    let ns = format!("bulk-{}", unique_suffix());
+
+    let mut seed = String::from("{\"@type\":\"create\",\"object\":\"MemoryLookupKey\",\"value\":{");
+    for i in 0..600 {
+        if i > 0 {
+            seed.push(',');
+        }
+        seed.push_str(&format!(
+            "\"k{i}\":{{\"namespace\":\"{ns}\",\"key\":\"k{i}@example.test\"}}"
+        ));
+    }
+    seed.push_str("}}\n");
+    let (created, _u, _d, failed) = apply_summary(seed.as_bytes());
+    assert_eq!(
+        (created, failed),
+        (600, 0),
+        "seeding must create more than one page of objects"
+    );
+
+    let plan = format!(
+        "{{\"@type\":\"destroy\",\"object\":\"MemoryLookupKey\",\"value\":{{\
+         \"namespace\":\"{ns}\"}}}}\n"
+    );
+    let out = run_with_stdin(&["apply", "--stdin", "--json"], plan.as_bytes());
+    assert_ok(&out, "destroy a filtered set spanning several pages");
+    assert!(
+        ids_with("MemoryLookupKey", "namespace", &ns).is_empty(),
+        "a destroy that stops at the first page reports success while leaving objects behind"
+    );
+}
+
+#[test]
+fn a_misspelled_top_level_key_is_rejected() {
+    require_server!();
+    let plan = b"{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+                 \"scoep\":{\"@type\":\"Local\"},\"value\":{\
+                 \"r\":{\"@type\":\"Local\",\"name\":\"typo.test\"}}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "a misspelled `scope` would be dropped by serde and silently widen the reconcile to \
+         the whole type"
+    );
+    assert!(
+        stderr_string(&out).contains("scoep"),
+        "expected the unknown key to be named: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn scope_on_a_non_variant_at_type_is_rejected() {
+    require_server!();
+    let plan = b"{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+                 \"scope\":{\"@type\":\"Loacl\"},\"value\":{}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "a typo'd variant name selects no objects, which looks exactly like a successful \
+         reconcile"
+    );
+    assert!(
+        stderr_string(&out).contains("not a variant"),
+        "expected a variant-name rejection: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn an_entry_outside_its_own_scope_is_rejected() {
+    require_server!();
+    let plan = b"{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+                 \"scope\":{\"@type\":\"Local\"},\"value\":{\
+                 \"m\":{\"@type\":\"Mx\",\"name\":\"outsider.test\"}}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "an entry the operation does not own could never match, so it would be recreated on \
+         every apply"
+    );
+    assert!(
+        stderr_string(&out).contains("outside its own `scope`"),
+        "expected an out-of-scope entry rejection: {}",
+        stderr_string(&out)
+    );
+}
+
+#[test]
+fn upsert_scope_does_not_reach_into_another_slice() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let owned = format!("upsc-o-{suffix}.test");
+    let other = format!("upsc-x-{suffix}.test");
+
+    let owned_id = create_domain(&owned);
+    let _owned_tree = DomainTree(owned_id.clone());
+    let other_id = create_domain(&other);
+    let _other_tree = DomainTree(other_id.clone());
+
+    let shared = format!("shared-{suffix}");
+    let outsider = create_account_user(&shared, &other_id);
+
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"Account\",\"matchOn\":[\"name\"],\
+         \"scope\":{{\"domainId\":\"{owned_id}\"}},\"value\":{{\
+         \"acc\":{{\"@type\":\"User\",\"name\":\"{shared}\",\"domainId\":\"{owned_id}\"}}}}}}\n"
+    )
+    .into_bytes();
+
+    let (c, _u, _d, f) = apply_summary(&plan);
+    assert_eq!(
+        (c, f),
+        (1, 0),
+        "the account must be created inside the scoped domain, not matched against the \
+         same-named account in another domain"
+    );
+    let in_scope = ids_with("Account", "domainId", &owned_id);
+    assert_eq!(
+        in_scope.len(),
+        1,
+        "exactly one account must exist in the scoped domain"
+    );
+    assert!(
+        ids_with("Account", "domainId", &other_id).contains(&outsider),
+        "the same-named account in the unscoped domain must be untouched"
+    );
+}
+
+#[test]
+fn reconcile_scope_unresolved_reference_is_rejected() {
+    require_server!();
+    let plan = b"{\"@type\":\"reconcile\",\"object\":\"Account\",\"matchOn\":[\"name\"],\
+                 \"scope\":{\"domainId\":\"#ghost\"},\"value\":{\
+                 \"a\":{\"@type\":\"User\",\"name\":\"nobody\"}}}\n";
+    let out = run_with_stdin(&["apply", "--stdin", "--dry-run"], plan);
+    assert!(
+        !out.status.success(),
+        "a scope reference with no producing op must be rejected upfront"
+    );
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("`scope`") && err.contains("#ghost"),
+        "expected an unresolved scope reference error: {err}"
     );
 }
 

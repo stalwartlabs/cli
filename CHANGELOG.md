@@ -2,15 +2,29 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.0.12] - 2026-07-XX
+## [1.0.12] - 2026-07-28
 
 ### Added
+- `upsert` and `reconcile` accept a `scope` restricting the slice of a type the operation owns, for matching and deletion (#18).
+- `"matchOn": "*"` opts an `upsert`/`reconcile` into value matching explicitly (#18).
 
 ### Changed
 - `apply` rejects an `upsert`/`reconcile` op whose entries share a match key.
+- `reconcile` on a multi-variant type now converges the whole type, not only the variants named in the plan; use `scope` to narrow it (#18).
+- `apply` rejects a `scope` on any op other than `upsert`/`reconcile`, an entry that falls outside its own operation's scope, and a `scope` on a server-derived property.
+- **Breaking:** `apply` now rejects any unrecognised top-level key in a plan operation instead of ignoring it, so that a misspelled `scope` cannot silently widen a `reconcile` to the whole type.
 
 ### Fixed
 - `apply` no longer creates a duplicate when a plan upserts the same match key twice.
+- Value matching no longer reads a server-returned `null` as drift when the plan body omits the property.
+- `reconcile` no longer destroys an object that a later operation in the same plan created, matched, or updated.
+- `reconcile` no longer fails when two operations in one plan mark the same object for deletion.
+- `apply` reports which value was wrong when `matchOn` is malformed.
+- An ambiguous value match is rejected instead of silently picking the first candidate.
+- Every paginated read now returns the whole type. `upsert`/`reconcile` duplicated objects and `reconcile` stopped converging, `destroy` reported success while leaving objects behind, and `snapshot` emitted a plan that looked complete but held only the first `maxObjectsInGet` objects.
+- `apply` no longer creates duplicates when two entries of a scoped operation share a match key they inherit from the `scope`.
+- An entry now inherits its operation's `scope`, so an omitted scoped property no longer creates an object outside the scope.
+- Concurrent invocations no longer corrupt the schema cache; each writer now uses its own temporary file.
 
 ## [1.0.11] - 2026-07-20
 
