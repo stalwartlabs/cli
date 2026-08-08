@@ -734,6 +734,29 @@ fn collect_refs(value: &Value, out: &mut HashSet<String>) {
     }
 }
 
+fn reference_labels<'a>(
+    refs: &HashSet<String>,
+    state_ids: &'a HashMap<String, String>,
+) -> set_error::ClientIds<'a> {
+    let mut labels = set_error::ClientIds::new();
+    let mut ambiguous: Vec<&str> = Vec::new();
+    for r in refs {
+        let Some((client_id, server_id)) = state_ids.get_key_value(r.as_str()) else {
+            continue;
+        };
+        if labels
+            .insert(server_id.as_str(), client_id.as_str())
+            .is_some()
+        {
+            ambiguous.push(server_id.as_str());
+        }
+    }
+    for server_id in ambiguous {
+        labels.remove(server_id);
+    }
+    labels
+}
+
 fn request_created_ids(
     refs: &HashSet<String>,
     state_ids: &HashMap<String, String>,
@@ -1907,7 +1930,12 @@ fn execute_update(
             "{}: update failed for id {}: {}",
             resolve::display_name(canonical),
             bad_id,
-            set_error::render(&set_err, Ansi::new(false)).replace('\n', " | ")
+            set_error::render_with_refs(
+                &set_err,
+                Ansi::new(false),
+                &reference_labels(&refs, created_ids)
+            )
+            .replace('\n', " | ")
         )));
     }
     let updated = result
@@ -1983,7 +2011,12 @@ fn execute_create(
                 resolve::display_name(canonical),
                 bad_id,
                 op_index + 1,
-                set_error::render(&set_err, Ansi::new(false)).replace('\n', " | ")
+                set_error::render_with_refs(
+                    &set_err,
+                    Ansi::new(false),
+                    &reference_labels(&refs, created_ids)
+                )
+                .replace('\n', " | ")
             )));
         }
 
@@ -2244,6 +2277,41 @@ fn past_tense(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_labels_map_server_ids_back_to_plan_refs() {
+        let mut refs = HashSet::new();
+        refs.insert("dnsserver-ovh".to_string());
+        refs.insert("tenant-a".to_string());
+        refs.insert("never-created".to_string());
+        let state_ids: HashMap<String, String> = [
+            ("dnsserver-ovh".to_string(), "i1nk7i22boqc".to_string()),
+            ("tenant-a".to_string(), "a4bc9".to_string()),
+            ("unreferenced".to_string(), "zzz".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let labels = reference_labels(&refs, &state_ids);
+        assert_eq!(labels.get("i1nk7i22boqc"), Some(&"dnsserver-ovh"));
+        assert_eq!(labels.get("a4bc9"), Some(&"tenant-a"));
+        assert_eq!(labels.get("zzz"), None);
+    }
+
+    #[test]
+    fn reference_labels_drop_ids_shared_by_two_refs() {
+        let mut refs = HashSet::new();
+        refs.insert("dns-a".to_string());
+        refs.insert("tenant-a".to_string());
+        let state_ids: HashMap<String, String> = [
+            ("dns-a".to_string(), "same".to_string()),
+            ("tenant-a".to_string(), "same".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(reference_labels(&refs, &state_ids).is_empty());
+    }
 
     fn lookup_key_schema() -> Schema {
         use crate::schema::Fields;

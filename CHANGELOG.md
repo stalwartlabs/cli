@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.13] - 2026-08-XX
+
+### Added
+
+### Changed
+- `apply` now annotates server ids in `set` errors with the plan reference (`#client-id`) that produced them.
+
+### Fixed
+
 ## [1.0.12] - 2026-07-28
 
 ### Added

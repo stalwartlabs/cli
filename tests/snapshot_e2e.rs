@@ -974,6 +974,53 @@ fn apply_destroy_op_removes_every_instance() {
 }
 
 #[test]
+fn apply_failure_names_the_plan_reference_behind_a_server_id() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let _gt = NameGuard {
+        object: "Tenant",
+        field: "name",
+        value: format!("reftenant-{suffix}"),
+    };
+    let _gd = NameGuard {
+        object: "DnsServer",
+        field: "description",
+        value: format!("refdns-{suffix}"),
+    };
+    let plan = format!(
+        "{{\"@type\":\"upsert\",\"object\":\"Tenant\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"tenant-a\":{{\"name\":\"reftenant-{suffix}\"}}}}}}\n\
+         {{\"@type\":\"upsert\",\"object\":\"DnsServer\",\"matchOn\":[\"description\"],\"value\":{{\
+         \"dnsserver-ovh\":{{\"@type\":\"Ovh\",\"description\":\"refdns-{suffix}\",\
+         \"applicationKey\":\"aaaaaaaaaaaaaaaa\",\
+         \"applicationSecret\":{{\"@type\":\"Value\",\"secret\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}},\
+         \"consumerKey\":{{\"@type\":\"Value\",\"secret\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}},\
+         \"ovhEndpoint\":\"ovh-eu\"}}}}}}\n\
+         {{\"@type\":\"upsert\",\"object\":\"Domain\",\"matchOn\":[\"name\"],\"value\":{{\
+         \"domain-a\":{{\"memberTenantId\":\"#tenant-a\",\"name\":\"refdom-{suffix}.test\",\
+         \"dnsManagement\":{{\"@type\":\"Automatic\",\"dnsServerId\":\"#dnsserver-ovh\"}}}}}}}}\n"
+    );
+
+    let out = run_with_stdin(&["apply", "--stdin"], plan.as_bytes());
+    assert!(
+        !out.status.success(),
+        "a tenant-scoped domain referencing a global DnsServer must fail\nstdout: {}\nstderr: {}",
+        stdout_string(&out),
+        stderr_string(&out),
+    );
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("invalidForeignKey"),
+        "expected an invalidForeignKey rejection, got: {err}"
+    );
+    assert!(
+        err.contains("(plan reference #dnsserver-ovh)"),
+        "the rejected server id must be traced back to the plan reference, got: {err}"
+    );
+}
+
+#[test]
 fn apply_continue_on_error_attempts_all_and_counts_failures() {
     require_server!();
     let plan = b"{\"@type\":\"update\",\"object\":\"Domain\",\"id\":\"missing-id-1\",\"value\":{\"description\":\"x\"}}\n\
