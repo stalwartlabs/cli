@@ -5,8 +5,7 @@
  */
 
 use crate::app::error::{CliError, CliResult};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use encodify::base64::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};

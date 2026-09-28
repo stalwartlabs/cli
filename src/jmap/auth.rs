@@ -5,8 +5,7 @@
  */
 
 use crate::app::config::AuthMode;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use encodify::base64::STANDARD;
 
 pub fn header_value(auth: &AuthMode) -> String {
     match auth {
@@ -15,8 +14,9 @@ pub fn header_value(auth: &AuthMode) -> String {
             raw.push_str(user);
             raw.push(':');
             raw.push_str(password);
-            let mut out = String::from("Basic ");
-            out.push_str(&STANDARD.encode(raw.as_bytes()));
+            let mut out = String::with_capacity(6 + STANDARD.encoded_len(raw.len()));
+            out.push_str("Basic ");
+            STANDARD.encode_append(raw, &mut out);
             out
         }
         AuthMode::Bearer { token } => {
