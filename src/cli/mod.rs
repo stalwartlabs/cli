@@ -189,7 +189,7 @@ pub struct ApplyArgs {
     /// Emit one NDJSON record per completed operation to stdout
     #[arg(long)]
     pub json: bool,
-    /// Print per-batch progress during large destroys and creates
+    /// Print per-batch progress during large destroy, create, upsert and reconcile operations
     #[arg(long)]
     pub progress: bool,
 }
@@ -219,4 +219,29 @@ pub struct SnapshotArgs {
     /// Suppress progress output on stderr
     #[arg(long)]
     pub quiet: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    // --progress help names every op kind that emits batch notes
+    #[test]
+    fn apply_progress_help_lists_every_batched_op() {
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("apply")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let line = help
+            .lines()
+            .skip_while(|l| !l.contains("--progress"))
+            .take(2)
+            .collect::<String>();
+        for kind in ["destroy", "create", "upsert", "reconcile"] {
+            assert!(line.contains(kind), "--progress help omits {kind}: {line}");
+        }
+    }
 }

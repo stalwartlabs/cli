@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.14] - 2026-XX-XX
+
+### Added
+
+### Changed
+
+### Fixed
+- `apply --progress` help text now mentions `upsert` and `reconcile`, which also report batch progress.
+
 ## [1.0.13] - 2026-09-28
 
 ### Added

@@ -896,6 +896,70 @@ impl Drop for NameGuard {
     }
 }
 
+// --progress prints batch notes for the create half of upsert and both halves of reconcile
+#[test]
+fn apply_progress_reports_upsert_and_reconcile_batches() {
+    require_server!();
+    let _serial = serial();
+    let suffix = unique_suffix();
+    let domain = format!("prog-{suffix}.example.com");
+    let a = format!("prog-a-{suffix}.test");
+    let b = format!("prog-b-{suffix}.test");
+    let _gd = NameGuard {
+        object: "Domain",
+        field: "name",
+        value: domain.clone(),
+    };
+    let _ga = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: a.clone(),
+    };
+    let _gb = NameGuard {
+        object: "MtaRoute",
+        field: "name",
+        value: b.clone(),
+    };
+
+    let out = run_with_stdin(
+        &["apply", "--stdin", "--progress"],
+        &upsert_domain_plan(&domain, "progress"),
+    );
+    assert_ok(&out, "apply --progress upsert");
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("creating Domain batch 1/1"),
+        "upsert must report its create batch: {err}"
+    );
+
+    let seed = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+         \"scope\":{{\"@type\":\"Local\"}},\"value\":{{\
+         \"a\":{{\"@type\":\"Local\",\"name\":\"{a}\"}}}}}}\n"
+    )
+    .into_bytes();
+    let (c0, _u0, _d0, f0) = apply_summary(&seed);
+    assert_eq!((c0, f0), (1, 0), "seed creates one Local route");
+
+    let step = format!(
+        "{{\"@type\":\"reconcile\",\"object\":\"MtaRoute\",\"matchOn\":[\"name\"],\
+         \"scope\":{{\"@type\":\"Local\"}},\"value\":{{\
+         \"b\":{{\"@type\":\"Local\",\"name\":\"{b}\"}}}}}}\n"
+    )
+    .into_bytes();
+    let out = run_with_stdin(&["apply", "--stdin", "--progress"], &step);
+    assert_ok(&out, "apply --progress reconcile");
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("creating MtaRoute batch 1/1"),
+        "reconcile must report its create batch: {err}"
+    );
+    assert!(
+        err.contains("destroying MtaRoute batch 1/1"),
+        "reconcile must report its leaked-object destroy batch: {err}"
+    );
+}
+
 #[test]
 fn snapshot_delete_apply_restores_deleted_objects() {
     require_server!();
