@@ -476,6 +476,8 @@ fn string_format_name(f: &StringFormat) -> &'static str {
         StringFormat::Color => "color",
         StringFormat::Text => "text",
         StringFormat::Html => "html",
+        StringFormat::Sieve => "sieve",
+        StringFormat::Unknown => "unknown",
     }
 }
 
@@ -486,6 +488,7 @@ fn number_format_name(f: &NumberFormat) -> &'static str {
         NumberFormat::Float => "float",
         NumberFormat::Size => "size",
         NumberFormat::Duration => "duration",
+        NumberFormat::Unknown => "unknown",
     }
 }
 

@@ -17,8 +17,6 @@ pub struct Schema {
     pub forms: HashMap<String, Form>,
     pub lists: HashMap<String, List>,
     pub enums: HashMap<String, Vec<EnumVariant>>,
-    pub dashboards: Vec<Dashboard>,
-    pub layouts: Vec<Layout>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -351,6 +349,22 @@ pub enum StringFormat {
     Color,
     Text,
     Html,
+    Sieve,
+    #[serde(other)]
+    Unknown,
+}
+
+impl StringFormat {
+    pub fn is_multiline(&self) -> bool {
+        matches!(
+            self,
+            StringFormat::SecretText
+                | StringFormat::Text
+                | StringFormat::Html
+                | StringFormat::Sieve
+                | StringFormat::Unknown
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -361,6 +375,8 @@ pub enum NumberFormat {
     Float,
     Size,
     Duration,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -382,127 +398,68 @@ pub struct EnumVariant {
     pub color: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Layout {
-    pub name: String,
-    pub icon: String,
-    pub items: Vec<LayoutItem>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum LayoutItem {
-    #[serde(rename_all = "camelCase")]
-    Container {
-        name: String,
-        icon: String,
-        items: Vec<LayoutSubItem>,
-    },
-    #[serde(rename_all = "camelCase")]
-    Link {
-        name: String,
-        icon: String,
-        view_name: String,
-    },
-}
+    fn schema_with_contents_format(format: &str) -> Schema {
+        serde_json::from_value(json!({
+            "objects": {},
+            "schemas": {},
+            "fields": {
+                "x:SieveUserScript": {
+                    "properties": {
+                        "contents": {
+                            "description": "Content of the script",
+                            "type": {"type": "string", "format": format},
+                            "update": "mutable"
+                        },
+                        "maxSize": {
+                            "description": "Size",
+                            "type": {"type": "number", "format": "futureNumber"},
+                            "update": "mutable"
+                        }
+                    }
+                }
+            },
+            "forms": {},
+            "lists": {},
+            "enums": {},
+            "dashboards": [{
+                "id": "overview",
+                "label": "Overview",
+                "cards": [{"aggregate": "last", "scope": "node", "format": "futureMetric"}]
+            }],
+            "layouts": [{"name": "x", "icon": "y", "items": [{"futureItem": {}}]}]
+        }))
+        .expect("schema fragment deserialises")
+    }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type")]
-#[serde(rename_all = "camelCase")]
-pub enum LayoutSubItem {
-    #[serde(rename_all = "camelCase")]
-    Container {
-        name: String,
-        items: Vec<LayoutSubItem>,
-    },
-    #[serde(rename_all = "camelCase")]
-    Link { name: String, view_name: String },
-}
+    fn contents_format(schema: &Schema) -> &StringFormat {
+        match &schema.fields["x:SieveUserScript"].properties["contents"].typ {
+            FieldType::String { format, .. } => format,
+            other => panic!("unexpected field type {other:?}"),
+        }
+    }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Dashboard {
-    pub id: String,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cards: Vec<Card>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub charts: Vec<Chart>,
-}
+    #[test]
+    fn sieve_string_format_deserialises() {
+        let schema = schema_with_contents_format("sieve");
+        assert_eq!(contents_format(&schema), &StringFormat::Sieve);
+        assert!(contents_format(&schema).is_multiline());
+    }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Card {
-    pub title: String,
-    pub icon: String,
-    pub source: CardSource,
-    pub metrics: Vec<String>,
-    #[serde(default)]
-    pub aggregate: Aggregate,
-    pub format: MetricFormat,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub sparkline: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub delta: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Series {
-    pub label: String,
-    pub metrics: Vec<String>,
-    #[serde(default)]
-    pub aggregate: Aggregate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Aggregate {
-    #[default]
-    Sum,
-    Avg,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Chart {
-    pub title: String,
-    pub kind: ChartKind,
-    pub series: Vec<Series>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stacked: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_format: Option<MetricFormat>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ChartKind {
-    #[default]
-    Line,
-    Area,
-    Bar,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CardSource {
-    #[default]
-    Live,
-    History,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum MetricFormat {
-    #[default]
-    Number,
-    Bytes,
-    Duration,
-    Percent,
+    #[test]
+    fn unknown_formats_degrade_to_unknown() {
+        let schema = schema_with_contents_format("futureFormat");
+        assert_eq!(contents_format(&schema), &StringFormat::Unknown);
+        assert!(matches!(
+            schema.fields["x:SieveUserScript"].properties["maxSize"].typ,
+            FieldType::Number {
+                format: NumberFormat::Unknown,
+                ..
+            }
+        ));
+    }
 }

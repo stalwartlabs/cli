@@ -235,6 +235,24 @@ fn render_field(
     out.push(':');
     out.push_str(ctx.ansi.reset());
 
+    let block_text = match &field.typ {
+        FieldType::String { format, .. } if format.is_multiline() => {
+            value.as_str().filter(|text| text.contains('\n'))
+        }
+        _ => None,
+    };
+    if let Some(text) = block_text {
+        out.push('\n');
+        for line in text.lines() {
+            if !line.is_empty() {
+                push_indent(out, base_indent + 4);
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        return;
+    }
+
     match &field.typ {
         FieldType::Object { object_name, .. } if !value.is_null() => {
             out.push('\n');
@@ -594,5 +612,69 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<u64>(), b.parse::<u64>()) {
         (Ok(x), Ok(y)) => x.cmp(&y),
         _ => a.cmp(b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn multiline_sieve_contents_render_as_indented_block() {
+        let schema: Schema = serde_json::from_value(json!({
+            "objects": {},
+            "schemas": {"SieveUserScript": {"type": "single", "schemaName": "x:SieveUserScript"}},
+            "fields": {
+                "x:SieveUserScript": {
+                    "properties": {
+                        "contents": {
+                            "description": "Content of the script",
+                            "type": {"type": "string", "format": "sieve"},
+                            "update": "mutable"
+                        },
+                        "name": {
+                            "description": "Name",
+                            "type": {"type": "string", "format": "string"},
+                            "update": "mutable"
+                        }
+                    }
+                }
+            },
+            "forms": {
+                "SieveUserScript": {
+                    "sections": [{
+                        "fields": [
+                            {"name": "contents", "label": "Contents"},
+                            {"name": "name", "label": "Name"}
+                        ]
+                    }]
+                }
+            },
+            "lists": {},
+            "enums": {}
+        }))
+        .expect("schema fragment deserialises");
+        let cache = DisplayCache::new();
+        let ctx = RenderCtx {
+            schema: &schema,
+            cache: &cache,
+            ansi: Ansi::new(false),
+        };
+        let obj = json!({
+            "contents": "require \"fileinto\";\n\nfileinto \"Spam\";\n",
+            "name": "spam"
+        });
+        let mut out = String::new();
+        render_top(
+            &mut out,
+            &ctx,
+            "SieveUserScript",
+            obj.as_object().expect("object"),
+        );
+        assert_eq!(
+            out,
+            "  Contents:\n    require \"fileinto\";\n\n    fileinto \"Spam\";\n  Name:     spam\n"
+        );
     }
 }
