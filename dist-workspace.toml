@@ -22,3 +22,6 @@ install-updater = false
 github-attestations = true
 # Allow dist to ignore drift in CI-owned files (e.g. customized release.yml)
 allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-latest"
