@@ -4,19 +4,27 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::schema::{Dashboard, Layout};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use serde_json::{Number, Value};
+use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
+
+pub const AT_TYPE: &str = "@type";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Schema {
-    pub objects: HashMap<String, ObjectType>,
+    pub objects: IndexMap<String, ObjectType>,
     pub schemas: HashMap<String, ObjectSchema>,
     pub fields: HashMap<String, Fields>,
     pub forms: HashMap<String, Form>,
     pub lists: HashMap<String, List>,
     pub enums: HashMap<String, Vec<EnumVariant>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layouts: Vec<Layout>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dashboards: Vec<Dashboard>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,11 +204,24 @@ pub struct FormField {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Fields {
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub properties: HashMap<String, Field>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub properties: IndexMap<String, Field>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub defaults: HashMap<String, Value>,
+}
+
+impl Fields {
+    pub fn comparable_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .properties
+            .iter()
+            .filter(|(_, f)| f.is_comparable_scalar())
+            .map(|(n, _)| n.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +234,45 @@ pub struct Field {
 
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enterprise: bool,
+}
+
+impl Field {
+    pub fn is_server_set(&self) -> bool {
+        matches!(self.update, FieldUpdate::ServerSet)
+    }
+
+    pub fn is_patchable(&self) -> bool {
+        !matches!(self.update, FieldUpdate::Immutable | FieldUpdate::ServerSet)
+    }
+
+    pub fn is_object_id(&self) -> bool {
+        matches!(self.typ, FieldType::ObjectId { .. })
+    }
+
+    pub fn is_comparable_scalar(&self) -> bool {
+        !self.is_server_set()
+            && !self.typ.is_secret_scalar()
+            && matches!(
+                self.typ,
+                FieldType::String { .. }
+                    | FieldType::Number { .. }
+                    | FieldType::Boolean
+                    | FieldType::Enum { .. }
+                    | FieldType::UtcDateTime { .. }
+            )
+    }
+}
+
+impl FieldType {
+    pub fn is_secret_scalar(&self) -> bool {
+        matches!(
+            self,
+            FieldType::String {
+                format: StringFormat::Secret | StringFormat::SecretText,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,7 +395,7 @@ pub enum MapValueType {
     Object { object_name: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum StringFormat {
     String,
@@ -354,6 +414,172 @@ pub enum StringFormat {
     Unknown,
 }
 
+impl Filter {
+    pub fn field(&self) -> &str {
+        match self {
+            Filter::Text { field, .. }
+            | Filter::Enum { field, .. }
+            | Filter::Integer { field, .. }
+            | Filter::Date { field, .. }
+            | Filter::ObjectId { field, .. } => field,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Filter::Text { label, .. }
+            | Filter::Enum { label, .. }
+            | Filter::Integer { label, .. }
+            | Filter::Date { label, .. }
+            | Filter::ObjectId { label, .. } => label,
+        }
+    }
+}
+
+impl ObjectSchema {
+    pub fn variant_of(&self, obj: &Map<String, Value>) -> Option<&ObjectVariant> {
+        let ObjectSchema::Multiple { variants } = self else {
+            return None;
+        };
+        let at_type = obj.get(AT_TYPE)?.as_str()?;
+        variants.iter().find(|v| v.name == at_type)
+    }
+
+    pub fn single_name(&self) -> Option<&str> {
+        match self {
+            ObjectSchema::Single { schema_name } => Some(schema_name),
+            ObjectSchema::Multiple { .. } => None,
+        }
+    }
+}
+
+impl FieldType {
+    pub fn references(&self, object: &str) -> bool {
+        match self {
+            FieldType::Object { object_name, .. }
+            | FieldType::ObjectList { object_name, .. }
+            | FieldType::ObjectId { object_name, .. } => object_name == object,
+            FieldType::Set { class, .. } => class.references(object),
+            FieldType::Map {
+                key_class,
+                value_class,
+                ..
+            } => {
+                key_class.references(object)
+                    || matches!(
+                        value_class,
+                        MapValueType::Object { object_name } if object_name == object
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_nullable(&self) -> bool {
+        match self {
+            FieldType::String { nullable, .. }
+            | FieldType::Number { nullable, .. }
+            | FieldType::UtcDateTime { nullable }
+            | FieldType::Enum { nullable, .. }
+            | FieldType::ObjectId { nullable, .. }
+            | FieldType::Object { nullable, .. } => *nullable,
+            _ => false,
+        }
+    }
+
+    pub fn is_composite(&self) -> bool {
+        matches!(
+            self,
+            FieldType::Object { .. }
+                | FieldType::ObjectList { .. }
+                | FieldType::Set { .. }
+                | FieldType::Map { .. }
+        )
+    }
+
+    pub fn is_nested_object(&self) -> bool {
+        matches!(
+            self,
+            FieldType::Object { .. }
+                | FieldType::ObjectList { .. }
+                | FieldType::Map {
+                    value_class: MapValueType::Object { .. },
+                    ..
+                }
+        )
+    }
+}
+
+impl FormField {
+    pub fn label_or_name(&self) -> &str {
+        if self.label.is_empty() {
+            &self.name
+        } else {
+            &self.label
+        }
+    }
+}
+
+impl ScalarType {
+    pub fn references(&self, object: &str) -> bool {
+        matches!(self, ScalarType::ObjectId { object_name } if object_name == object)
+    }
+
+    pub fn field_type(&self) -> FieldType {
+        match self {
+            ScalarType::String {
+                format,
+                min_length,
+                max_length,
+            } => FieldType::String {
+                format: *format,
+                min_length: *min_length,
+                max_length: *max_length,
+                nullable: false,
+            },
+            ScalarType::ObjectId { object_name } => FieldType::ObjectId {
+                object_name: object_name.clone(),
+                nullable: false,
+            },
+            ScalarType::Enum { enum_name } => FieldType::Enum {
+                enum_name: enum_name.clone(),
+                nullable: false,
+            },
+        }
+    }
+}
+
+impl MapValueType {
+    pub fn field_type(&self) -> FieldType {
+        match self {
+            MapValueType::String {
+                format,
+                min_length,
+                max_length,
+            } => FieldType::String {
+                format: *format,
+                min_length: *min_length,
+                max_length: *max_length,
+                nullable: false,
+            },
+            MapValueType::Number { format, min, max } => FieldType::Number {
+                format: *format,
+                min: min.clone(),
+                max: max.clone(),
+                nullable: false,
+            },
+            MapValueType::Enum { enum_name } => FieldType::Enum {
+                enum_name: enum_name.clone(),
+                nullable: false,
+            },
+            MapValueType::Object { object_name } => FieldType::Object {
+                object_name: object_name.clone(),
+                nullable: false,
+            },
+        }
+    }
+}
+
 impl StringFormat {
     pub fn is_multiline(&self) -> bool {
         matches!(
@@ -367,7 +593,7 @@ impl StringFormat {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum NumberFormat {
     Integer,
@@ -398,68 +624,7 @@ pub struct EnumVariant {
     pub color: Option<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn schema_with_contents_format(format: &str) -> Schema {
-        serde_json::from_value(json!({
-            "objects": {},
-            "schemas": {},
-            "fields": {
-                "x:SieveUserScript": {
-                    "properties": {
-                        "contents": {
-                            "description": "Content of the script",
-                            "type": {"type": "string", "format": format},
-                            "update": "mutable"
-                        },
-                        "maxSize": {
-                            "description": "Size",
-                            "type": {"type": "number", "format": "futureNumber"},
-                            "update": "mutable"
-                        }
-                    }
-                }
-            },
-            "forms": {},
-            "lists": {},
-            "enums": {},
-            "dashboards": [{
-                "id": "overview",
-                "label": "Overview",
-                "cards": [{"aggregate": "last", "scope": "node", "format": "futureMetric"}]
-            }],
-            "layouts": [{"name": "x", "icon": "y", "items": [{"futureItem": {}}]}]
-        }))
-        .expect("schema fragment deserialises")
-    }
-
-    fn contents_format(schema: &Schema) -> &StringFormat {
-        match &schema.fields["x:SieveUserScript"].properties["contents"].typ {
-            FieldType::String { format, .. } => format,
-            other => panic!("unexpected field type {other:?}"),
-        }
-    }
-
-    #[test]
-    fn sieve_string_format_deserialises() {
-        let schema = schema_with_contents_format("sieve");
-        assert_eq!(contents_format(&schema), &StringFormat::Sieve);
-        assert!(contents_format(&schema).is_multiline());
-    }
-
-    #[test]
-    fn unknown_formats_degrade_to_unknown() {
-        let schema = schema_with_contents_format("futureFormat");
-        assert_eq!(contents_format(&schema), &StringFormat::Unknown);
-        assert!(matches!(
-            schema.fields["x:SieveUserScript"].properties["maxSize"].typ,
-            FieldType::Number {
-                format: NumberFormat::Unknown,
-                ..
-            }
-        ));
-    }
-}
+#[cfg(all(test, stalwart_cli_tests))]
+#[rustfmt::skip]
+#[path = "../../../cli-tests/unit/src/schema/types/tests.rs"]
+mod tests;

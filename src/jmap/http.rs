@@ -4,390 +4,277 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::app::config::Config;
-use crate::app::error::{CliError, CliResult};
-use crate::jmap::auth;
-use crate::jmap::cache::{SchemaCache, hash_b64};
-use crate::render::Ansi;
-use crate::schema::Schema;
-use flate2::read::GzDecoder;
-use reqwest::blocking::{Client, Response};
+use crate::error::{Error, Result};
+use crate::jmap::credential::Credential;
+use bytes::Bytes;
+use log::{Level, debug, log_enabled};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{
-    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION,
+    ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue,
 };
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
-use std::fmt::Write as _;
-use std::io::Read;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-const SNIPPET_MAX_BYTES: usize = 200;
+pub const HTTP_TRACE: &str = "stalwart_cli::http";
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const JSON: &str = "application/json";
+const FORM: &str = "application/x-www-form-urlencoded";
+const EVENT_STREAM: &str = "text/event-stream";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsVerify {
+    Verify,
+    Insecure,
+}
+
+pub struct ConnectOptions {
+    pub url: String,
+    pub credential: Arc<Credential>,
+    pub tls: TlsVerify,
+}
 
 pub struct HttpClient {
     base_url: String,
     inner: Client,
-    auth_header: HeaderValue,
-    debug: bool,
+    credential: Option<Arc<Credential>>,
+    bounded_timeout: Duration,
+}
+
+struct Body {
+    bytes: Bytes,
+    content_type: &'static str,
 }
 
 impl HttpClient {
-    pub fn new(config: &Config) -> CliResult<Self> {
-        let auth_header = HeaderValue::from_str(&auth::header_value(&config.auth))
-            .map_err(|e| CliError::msg(format!("invalid auth header: {e}")))?;
+    pub fn new(opts: &ConnectOptions) -> Result<Self> {
+        Self::build(
+            &opts.url,
+            Some(opts.credential.clone()),
+            opts.tls,
+            Some(REQUEST_TIMEOUT),
+        )
+    }
 
+    pub fn streaming(opts: &ConnectOptions) -> Result<Self> {
+        Self::build(&opts.url, Some(opts.credential.clone()), opts.tls, None)
+    }
+
+    pub fn anonymous(url: &str, tls: TlsVerify) -> Result<Self> {
+        Self::build(url, None, tls, Some(REQUEST_TIMEOUT))
+    }
+
+    fn build(
+        url: &str,
+        credential: Option<Arc<Credential>>,
+        tls: TlsVerify,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
         let mut builder = Client::builder()
             .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(60))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(timeout)
             .no_gzip();
 
-        if config.insecure {
+        if tls == TlsVerify::Insecure {
             builder = builder
                 .danger_accept_invalid_certs(true)
                 .danger_accept_invalid_hostnames(true);
         }
 
-        let inner = builder.build()?;
-
         Ok(HttpClient {
-            base_url: config.url.clone(),
-            inner,
-            auth_header,
-            debug: config.debug,
+            base_url: url.trim_end_matches('/').to_string(),
+            inner: builder.build()?,
+            credential,
+            bounded_timeout: REQUEST_TIMEOUT,
         })
     }
 
-    fn url(&self, path: &str) -> String {
-        let mut out = String::with_capacity(self.base_url.len() + path.len() + 1);
+    pub fn resolve(&self, endpoint: &str) -> String {
+        if is_absolute(endpoint) {
+            return endpoint.to_string();
+        }
+        let mut out = String::with_capacity(self.base_url.len() + endpoint.len() + 1);
         out.push_str(&self.base_url);
-        if !path.starts_with('/') {
+        if !endpoint.starts_with('/') {
             out.push('/');
         }
-        out.push_str(path);
+        out.push_str(endpoint);
         out
     }
 
-    pub fn get_raw(&self, path: &str) -> CliResult<Response> {
-        let url = self.url(path);
-        if self.debug {
-            eprintln!("[debug] -> GET {url}");
-        }
-        let resp = self
-            .inner
-            .request(Method::GET, &url)
-            .header(AUTHORIZATION, self.auth_header.clone())
-            .send()?;
-        self.log_response("GET", &url, &resp);
-        Ok(resp)
+    pub fn get_any_status(&self, path: &str) -> Result<Response> {
+        self.send(Method::GET, &self.resolve(path), None, None)
     }
 
-    pub fn post_json(&self, path: &str, body: &serde_json::Value) -> CliResult<Response> {
-        let url = self.url(path);
-        if self.debug {
-            eprintln!("[debug] -> POST {url}");
-        }
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, self.auth_header.clone());
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let resp = self
-            .inner
-            .request(Method::POST, &url)
-            .headers(headers)
-            .json(body)
-            .send()?;
-        self.log_response("POST", &url, &resp);
-        Ok(resp)
+    pub fn get(&self, path: &str) -> Result<Response> {
+        success(self.get_any_status(path)?)
     }
 
-    fn log_response(&self, method: &str, url: &str, resp: &Response) {
-        if !self.debug {
-            return;
-        }
-        let status = resp.status();
-        let ct = header_str(resp.headers().get(CONTENT_TYPE)).unwrap_or("(none)");
-        let cl = header_str(resp.headers().get(CONTENT_LENGTH)).unwrap_or("?");
-        let ce = header_str(resp.headers().get(CONTENT_ENCODING)).unwrap_or("identity");
-        eprintln!(
-            "[debug] <- {method} {url} status={status} content-type={ct} content-length={cl} content-encoding={ce}"
-        );
+    pub fn post_json(&self, path: &str, body: Vec<u8>) -> Result<Response> {
+        let body = Body {
+            bytes: Bytes::from(body),
+            content_type: JSON,
+        };
+        success(self.send(Method::POST, &self.resolve(path), Some(body), None)?)
     }
-}
 
-pub fn status_error(status: StatusCode) -> CliError {
-    match status.as_u16() {
-        401 => CliError::AuthFailed,
-        403 => CliError::PermissionDenied,
-        404 => CliError::NotFound,
-        429 => CliError::RateLimited,
-        code => CliError::HttpStatus(code),
+    pub fn get_anonymous(&self, url: &str) -> Result<Response> {
+        self.send_once(self.bounded(Method::GET, url, None), &Method::GET, url)
     }
-}
 
-pub fn fetch_schema(client: &HttpClient, cache: &SchemaCache, color: bool) -> CliResult<Schema> {
-    match fetch_schema_inner(client, cache) {
-        Ok(s) => Ok(s),
-        Err(e) => {
-            if let Some((hash, bytes)) = cache.any_cached() {
-                let ansi = Ansi::new(color);
-                eprintln!(
-                    "{}warning:{} failed to refresh schema ({e}); using cached copy",
-                    ansi.yellow(),
-                    ansi.reset(),
-                );
-                match serde_json::from_slice::<Schema>(&bytes) {
-                    Ok(schema) => Ok(schema),
-                    Err(parse_err) => {
-                        let file = cache.file_for_hash(&hash).display().to_string();
-                        cache.invalidate(&hash);
-                        Err(CliError::SchemaCacheCorrupt {
-                            file,
-                            reason: parse_err.to_string(),
-                            byte_len: bytes.len(),
-                            snippet: snippet(&bytes, SNIPPET_MAX_BYTES),
-                        })
-                    }
-                }
-            } else {
-                Err(e)
+    pub fn post_form_anonymous(&self, url: &str, form: &[(&str, &str)]) -> Result<Response> {
+        let encoded = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(form)
+            .finish();
+        let body = Body {
+            bytes: Bytes::from(encoded),
+            content_type: FORM,
+        };
+        self.send_once(
+            self.bounded(Method::POST, url, Some(&body)),
+            &Method::POST,
+            url,
+        )
+    }
+
+    pub fn post_json_anonymous(&self, url: &str, body: Vec<u8>) -> Result<Response> {
+        let body = Body {
+            bytes: Bytes::from(body),
+            content_type: JSON,
+        };
+        self.send_once(
+            self.bounded(Method::POST, url, Some(&body)),
+            &Method::POST,
+            url,
+        )
+    }
+
+    pub fn get_event_stream(&self, path: &str) -> Result<Response> {
+        success(self.send(Method::GET, &self.resolve(path), None, Some(EVENT_STREAM))?)
+    }
+
+    fn send(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<Body>,
+        accept: Option<&'static str>,
+    ) -> Result<Response> {
+        let mut retried = false;
+        loop {
+            let (header, generation) = self.fresh_header()?;
+            let mut request = self.request(method.clone(), url, body.as_ref());
+            if let Some(accept) = accept {
+                request = request.header(ACCEPT, HeaderValue::from_static(accept));
+            }
+            if let Some(header) = header {
+                request = request.header(AUTHORIZATION, header);
+            }
+            let response = self.send_once(request, &method, url)?;
+            if !self.should_retry(&response, generation, &mut retried)? {
+                return Ok(response);
             }
         }
     }
-}
 
-fn fetch_schema_inner(client: &HttpClient, cache: &SchemaCache) -> CliResult<Schema> {
-    let path = "/api/schema";
-    let resp = client.get_raw(path)?;
-    let status = resp.status();
+    fn fresh_header(&self) -> Result<(Option<HeaderValue>, u64)> {
+        let Some(credential) = &self.credential else {
+            return Ok((None, 0));
+        };
+        let (header, generation) = credential.header();
+        let now = SystemTime::now();
+        if !credential.needs_refresh(now) {
+            return Ok((Some(header), generation));
+        }
+        match credential.refresh_after(self, generation) {
+            Ok(()) => {
+                let (header, generation) = credential.header();
+                Ok((Some(header), generation))
+            }
+            Err(Error::SessionExpired) => Err(Error::SessionExpired),
+            Err(_) if credential.is_unexpired(now) => Ok((Some(header), generation)),
+            Err(e) => Err(e),
+        }
+    }
 
-    if status.is_redirection() {
-        let hash = extract_hash_from_location(&resp)?;
-        if cache.latest_hash().as_deref() == Some(hash.as_str())
-            && let Some(bytes) = cache.read(&hash)
-            && let Ok(schema) = serde_json::from_slice::<Schema>(&bytes)
+    fn should_retry(
+        &self,
+        response: &Response,
+        generation: u64,
+        retried: &mut bool,
+    ) -> Result<bool> {
+        let Some(credential) = &self.credential else {
+            return Ok(false);
+        };
+        if *retried || response.status() != StatusCode::UNAUTHORIZED || !credential.is_refreshable()
         {
-            return Ok(schema);
+            return Ok(false);
         }
-        let hashed_path = format!("/api/schema/{}", hash);
-        let body = client.get_raw(&hashed_path)?;
-        let body_status = body.status();
-        if !body_status.is_success() {
-            return Err(status_error(body_status));
+        *retried = true;
+        credential.refresh_after(self, generation)?;
+        Ok(true)
+    }
+
+    fn bounded(&self, method: Method, url: &str, body: Option<&Body>) -> RequestBuilder {
+        self.request(method, url, body)
+            .timeout(self.bounded_timeout)
+    }
+
+    fn request(&self, method: Method, url: &str, body: Option<&Body>) -> RequestBuilder {
+        let request = self.inner.request(method, url);
+        match body {
+            Some(body) => request
+                .header(CONTENT_TYPE, HeaderValue::from_static(body.content_type))
+                .body(body.bytes.clone()),
+            None => request,
         }
-        let content_type = response_content_type(&body);
-        let decoded = read_schema_body(body)?;
-        let schema = parse_schema(&decoded, &hashed_path, body_status.as_u16(), &content_type)?;
-        cache.write(&hash, &decoded)?;
-        Ok(schema)
-    } else if status.is_success() {
-        let content_type = response_content_type(&resp);
-        let decoded = read_schema_body(resp)?;
-        let hash = hash_b64(&decoded);
-        let schema = parse_schema(&decoded, path, status.as_u16(), &content_type)?;
-        cache.write(&hash, &decoded)?;
-        Ok(schema)
-    } else {
-        Err(status_error(status))
+    }
+
+    fn send_once(&self, request: RequestBuilder, method: &Method, url: &str) -> Result<Response> {
+        debug!(target: HTTP_TRACE, "-> {method} {url}");
+        let resp = request.send()?;
+        if log_enabled!(target: HTTP_TRACE, Level::Debug) {
+            let status = resp.status();
+            let headers = resp.headers();
+            let ct = header_str(headers.get(CONTENT_TYPE)).unwrap_or("(none)");
+            let cl = header_str(headers.get(CONTENT_LENGTH)).unwrap_or("?");
+            let ce = header_str(headers.get(CONTENT_ENCODING)).unwrap_or("identity");
+            debug!(
+                target: HTTP_TRACE,
+                "<- {method} {url} status={status} content-type={ct} content-length={cl} content-encoding={ce}"
+            );
+        }
+        Ok(resp)
     }
 }
 
-fn parse_schema(bytes: &[u8], path: &str, status: u16, content_type: &str) -> CliResult<Schema> {
-    serde_json::from_slice(bytes).map_err(|e| CliError::SchemaParse {
-        path: path.to_string(),
-        reason: e.to_string(),
-        status,
-        content_type: content_type.to_string(),
-        byte_len: bytes.len(),
-        snippet: snippet(bytes, SNIPPET_MAX_BYTES),
-    })
+pub fn is_absolute(endpoint: &str) -> bool {
+    endpoint.starts_with("https://") || endpoint.starts_with("http://")
 }
 
-fn response_content_type(resp: &Response) -> String {
-    header_str(resp.headers().get(CONTENT_TYPE))
-        .unwrap_or("")
-        .to_string()
+pub fn success(resp: Response) -> Result<Response> {
+    let status = resp.status();
+    if status.is_success() {
+        Ok(resp)
+    } else {
+        Err(status.into())
+    }
 }
 
-fn header_str(value: Option<&HeaderValue>) -> Option<&str> {
+pub(super) fn header_str(value: Option<&HeaderValue>) -> Option<&str> {
     value.and_then(|v| v.to_str().ok())
 }
 
-fn read_schema_body(resp: Response) -> CliResult<Vec<u8>> {
-    let encoding =
-        header_str(resp.headers().get(CONTENT_ENCODING)).map(|s| s.trim().to_ascii_lowercase());
-    let bytes = resp.bytes()?;
-    decode_schema_body(&bytes, encoding.as_deref())
-}
+#[cfg(all(test, stalwart_cli_tests))]
+#[rustfmt::skip]
+#[path = "../../../cli-tests/unit/src/jmap/http/test_support.rs"]
+mod test_support;
 
-fn decode_schema_body(bytes: &[u8], content_encoding: Option<&str>) -> CliResult<Vec<u8>> {
-    match content_encoding {
-        Some("gzip") | Some("x-gzip") => gunzip(bytes),
-        Some("identity") | Some("") | None => {
-            if has_gzip_magic(bytes) {
-                gunzip(bytes)
-            } else {
-                Ok(bytes.to_vec())
-            }
-        }
-        Some(other) => Err(CliError::UnexpectedResponse(format!(
-            "unsupported Content-Encoding: {other}"
-        ))),
-    }
-}
-
-fn has_gzip_magic(bytes: &[u8]) -> bool {
-    bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b
-}
-
-fn extract_hash_from_location(resp: &Response) -> CliResult<String> {
-    let loc = resp
-        .headers()
-        .get(LOCATION)
-        .ok_or_else(|| CliError::UnexpectedResponse("redirect without Location header".into()))?
-        .to_str()
-        .map_err(|e| CliError::UnexpectedResponse(format!("invalid Location header: {e}")))?;
-    let hash = loc
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            CliError::UnexpectedResponse(format!("unexpected Location format: {loc}"))
-        })?;
-    Ok(hash.to_string())
-}
-
-fn gunzip(bytes: &[u8]) -> CliResult<Vec<u8>> {
-    let mut dec = GzDecoder::new(bytes);
-    let mut out = Vec::new();
-    dec.read_to_end(&mut out)?;
-    Ok(out)
-}
-
-fn snippet(bytes: &[u8], max_bytes: usize) -> String {
-    let truncated = if bytes.len() > max_bytes {
-        &bytes[..max_bytes]
-    } else {
-        bytes
-    };
-    let lossy = String::from_utf8_lossy(truncated);
-    let mut out = String::with_capacity(lossy.len() + 4);
-    out.push('"');
-    for c in lossy.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                let _ = write!(out, "\\u{{{:04x}}}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    if bytes.len() > max_bytes {
-        out.push_str(" (truncated)");
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write;
-
-    fn gzip(bytes: &[u8]) -> Vec<u8> {
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(bytes).unwrap();
-        enc.finish().unwrap()
-    }
-
-    #[test]
-    fn decodes_gzip_with_content_encoding_header() {
-        let plain = br#"{"schema":true}"#;
-        let compressed = gzip(plain);
-        let decoded = decode_schema_body(&compressed, Some("gzip")).unwrap();
-        assert_eq!(decoded, plain);
-    }
-
-    #[test]
-    fn accepts_plain_json_without_content_encoding() {
-        let plain = br#"{"schema":true}"#;
-        let decoded = decode_schema_body(plain, None).unwrap();
-        assert_eq!(decoded, plain);
-    }
-
-    #[test]
-    fn falls_back_to_gzip_magic_without_content_encoding() {
-        let plain = br#"{"schema":true}"#;
-        let compressed = gzip(plain);
-        let decoded = decode_schema_body(&compressed, None).unwrap();
-        assert_eq!(decoded, plain);
-    }
-
-    #[test]
-    fn accepts_plain_json_with_identity_encoding() {
-        let plain = br#"{"schema":true}"#;
-        let decoded = decode_schema_body(plain, Some("identity")).unwrap();
-        assert_eq!(decoded, plain);
-    }
-
-    #[test]
-    fn rejects_unsupported_content_encoding() {
-        let err = decode_schema_body(b"anything", Some("br")).unwrap_err();
-        assert!(matches!(err, CliError::UnexpectedResponse(_)));
-    }
-
-    #[test]
-    fn snippet_quotes_short_text() {
-        assert_eq!(snippet(b"hello", 200), "\"hello\"");
-    }
-
-    #[test]
-    fn snippet_escapes_control_characters() {
-        assert_eq!(snippet(b"a\nb\tc\rd", 200), "\"a\\nb\\tc\\rd\"",);
-    }
-
-    #[test]
-    fn snippet_escapes_quotes_and_backslashes() {
-        assert_eq!(snippet(br#"a"\b"#, 200), "\"a\\\"\\\\b\"");
-    }
-
-    #[test]
-    fn snippet_truncates_long_input() {
-        let long = b"x".repeat(500);
-        let s = snippet(&long, 200);
-        assert!(s.starts_with('"'));
-        assert!(s.ends_with("(truncated)"));
-        assert_eq!(s.matches('x').count(), 200);
-    }
-
-    #[test]
-    fn snippet_handles_invalid_utf8() {
-        let bytes: &[u8] = &[b'a', 0xff, 0xfe, b'b'];
-        let s = snippet(bytes, 200);
-        assert!(s.starts_with("\"a"));
-        assert!(s.ends_with("b\""));
-    }
-
-    #[test]
-    fn schema_parse_error_includes_diagnostics() {
-        let err = parse_schema(b"<!doctype html>", "/api/schema", 200, "text/html");
-        let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("/api/schema"), "{msg}");
-        assert!(msg.contains("status: 200"), "{msg}");
-        assert!(msg.contains("text/html"), "{msg}");
-        assert!(msg.contains("body length: 15 bytes"), "{msg}");
-        assert!(msg.contains("<!doctype html>"), "{msg}");
-    }
-
-    #[test]
-    fn schema_parse_error_on_empty_body() {
-        let err = parse_schema(b"", "/api/schema", 200, "");
-        let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("body length: 0 bytes"), "{msg}");
-        assert!(msg.contains("body snippet: \"\""), "{msg}");
-    }
-}
+#[cfg(all(test, stalwart_cli_tests))]
+#[rustfmt::skip]
+#[path = "../../../cli-tests/unit/src/jmap/http/tests.rs"]
+mod tests;

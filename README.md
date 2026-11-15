@@ -29,21 +29,30 @@
 </p>
 
 
-A schema-driven command line tool for administering [Stalwart Mail and Collaboration Server](https://stalw.art) over its JMAP API.
+A schema-driven command line tool and interactive console for administering [Stalwart Mail and Collaboration Server](https://stalw.art) over its JMAP API.
 
-The tool fetches the server's schema on first use and derives every command, validation rule, and rendered view from it. The same binary works against any compatible Stalwart deployment without recompilation.
+The tool fetches the server's schema on first use and derives every command, validation rule, form and rendered view from it. The same binary works against any compatible Stalwart deployment without recompilation.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./img/dashboard-dark.png">
+    <img src="./img/dashboard-light.png" alt="The Stalwart interactive console showing the Overview dashboard">
+  </picture>
+</p>
 
 ## Overview
 
 | | |
 |---|---|
+| `stalwart-cli` / `tui` | Open the interactive console: browse and edit every object, watch the dashboard, follow live traces, run actions, apply plans. |
 | `describe` | Inspect objects, fields, enums, filters, and sort options exposed by the server. |
 | `get` / `query` | Fetch a single object or list / filter many. |
 | `create` / `update` / `delete` | Single-object mutations. |
-| `apply` | Apply a JSON plan of bulk creates, updates, and destroys (intended for Ansible, Terraform, NixOS, Pulumi, and CI/CD pipelines). |
-| `snapshot` | Export live server state as an `apply`-ready JSON plan. Useful for backups, cross-environment promotion, and round-trip disaster-recovery rehearsals. |
+| `apply` | Apply an NDJSON plan of creates, updates, upserts, reconciles, and destroys (intended for Ansible, Terraform, NixOS, Pulumi, and CI/CD pipelines). |
+| `snapshot` | Export live server state as an `apply`-ready plan. Useful for backups, cross-environment promotion, and round-trip disaster-recovery rehearsals. |
+| `logout` | Revoke and forget the stored sign-in for a server. |
 
-Output is human-friendly by default (sectioned, with color when stdout is a TTY) and switches to compact JSON or NDJSON for machine consumption.
+Command output is human-friendly by default (sectioned, with colour when the stream is a terminal) and switches to compact JSON or NDJSON with `--json`.
 
 ## Install
 
@@ -81,7 +90,7 @@ docker run --rm \
   ghcr.io/stalwartlabs/cli query Account --fields id,name
 ```
 
-Tags track releases (`:1.2.3`, `:1.2`, `:latest`). Images are signed with cosign and carry build-provenance attestations.
+Tags track releases (`:2.0.0`, `:2.0`, `:latest`). Images are signed with cosign and carry build-provenance attestations.
 
 `apply --file` and `snapshot --output` need a mounted working directory, and a persistent schema cache avoids a re-fetch on every run:
 
@@ -90,16 +99,55 @@ docker run --rm \
   -v "$PWD:/work" -w /work \
   -v stalwart-cli-cache:/home/nonroot/.cache \
   -e STALWART_URL -e STALWART_TOKEN \
-  ghcr.io/stalwartlabs/cli apply --file plan.json
+  ghcr.io/stalwartlabs/cli apply --file plan.ndjson
+```
+
+The interactive console needs a terminal (`-it`), and a volume at `/home/nonroot/.local/share` keeps the device sign-in across runs:
+
+```sh
+docker run --rm -it \
+  -v stalwart-cli-cache:/home/nonroot/.cache \
+  -v stalwart-cli-data:/home/nonroot/.local/share \
+  -e STALWART_URL \
+  ghcr.io/stalwartlabs/cli
+```
+
+## Interactive console
+
+Run `stalwart-cli` without arguments in a terminal (or `stalwart-cli tui`) to open a full-screen console with the same navigation, forms and dashboards as the web administration interface:
+
+- Browse, filter, sort and edit any object, with field help and a review of every change before it is saved.
+- Mark objects and act on them in bulk: delete, or run the bulk actions the schema defines.
+- Jump to any view, object or setting with `:`, and see the keys of every screen with `?`.
+- Watch the dashboard, follow live tracing, run delivery tests and server actions.
+- Apply plans and take snapshots without leaving the console.
+- Four colour themes (`--theme dark|light|ansi16|mono`, `Ctrl+T` to cycle).
+
+```sh
+stalwart-cli --url https://mail.example.com
 ```
 
 ## Quick start
 
+There are three ways to authenticate. At a terminal, the OAuth device sign-in is the default when no credential is given and the server supports it: the CLI prints a code to approve in a browser, then stores a session that later commands reuse.
+
 ```sh
 export STALWART_URL=https://mail.example.com
+
+# Device sign-in (stored and refreshed automatically; `stalwart-cli logout` to forget it)
+stalwart-cli describe
+
+# API key, for scripts and CI
+export STALWART_TOKEN='API_<key>'
+
+# Or user and password
 export STALWART_USER=admin
 export STALWART_PASSWORD='changeme'
+```
 
+Common commands:
+
+```sh
 stalwart-cli describe                       # list every available object
 stalwart-cli describe domain                # full schema for one object
 stalwart-cli query domain                   # default columns
@@ -107,16 +155,15 @@ stalwart-cli get domain <id>                # full object
 stalwart-cli create domain --field name=example.com --field isEnabled=true
 stalwart-cli update domain <id> --field description='Primary'
 stalwart-cli delete domain --ids <id>
-stalwart-cli apply --file plan.json         # bulk apply
-stalwart-cli snapshot Tenant Domain \        # export state as an apply plan
-    --output backup.json
+stalwart-cli apply --file plan.ndjson       # bulk apply
+stalwart-cli snapshot Tenant Domain --output backup.ndjson   # export state as an apply plan
 ```
 
 ## Documentation
 
-Full documentation, including the bulk-apply file format, JSON Schema, and integration guides for Ansible / Terraform / NixOS / Pulumi / CI:
+Full documentation, including the interactive console, sign-in options, the plan file format, and integration guides for Ansible / Terraform / NixOS / Pulumi / CI:
 
-**[stalw.art/docs/management/cli](https://stalw.art/docs/management/cli/overview)**
+**[stalw.art/docs/management/cli](https://stalw.art/docs/management/cli/)**
 
 ## License
 

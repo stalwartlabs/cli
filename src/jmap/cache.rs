@@ -4,12 +4,18 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::app::error::{CliError, CliResult};
+use crate::error::Result;
 use encodify::base64::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const CACHE_DIR_NAME: &str = "stalwart-cli";
+const LATEST: &str = "latest";
+const SCHEMA_FILE_PREFIX: &str = "schema-";
+const SCHEMA_FILE_SUFFIX: &str = ".json";
 
 pub fn hash_b64(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -18,69 +24,67 @@ pub fn hash_b64(bytes: &[u8]) -> String {
 
 pub fn normalise_url(raw: &str) -> String {
     let trimmed = raw.trim();
-    let Some((scheme_raw, rest)) = trimmed.split_once("://") else {
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
         return trimmed.trim_end_matches('/').to_string();
     };
 
-    let scheme_lc = scheme_raw.to_ascii_lowercase();
-    let host_and_port = match rest.find(['/', '?', '#']) {
-        Some(i) => &rest[..i],
-        None => rest,
-    };
-    let host_and_port_lc = host_and_port.to_ascii_lowercase();
-
-    let cleaned = if scheme_lc == "http" || scheme_lc == "https" {
-        strip_default_port(&host_and_port_lc, &scheme_lc)
-    } else {
-        host_and_port_lc
+    let host_and_port = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = match default_port(scheme) {
+        Some(port) => strip_port(host_and_port, port),
+        None => host_and_port,
     };
 
-    let mut out = String::with_capacity(scheme_lc.len() + 3 + cleaned.len());
-    out.push_str(&scheme_lc);
+    let mut out = String::with_capacity(scheme.len() + 3 + host.len());
+    out.push_str(scheme);
     out.push_str("://");
-    out.push_str(&cleaned);
+    out.push_str(host);
+    out.make_ascii_lowercase();
     out
 }
 
-fn strip_default_port(host_and_port: &str, scheme: &str) -> String {
-    if let Some((host, port)) = host_and_port.rsplit_once(':') {
-        if host.starts_with('[') && !host.ends_with(']') {
-            return host_and_port.to_string();
-        }
-        let default = match scheme {
-            "https" => "443",
-            "http" => "80",
-            _ => "",
-        };
-        if port == default {
-            return host.to_string();
-        }
+fn default_port(scheme: &str) -> Option<&'static str> {
+    hashify::map_ignore_case!(scheme.as_bytes(), &'static str, "https" => "443", "http" => "80")
+        .copied()
+}
+
+fn strip_port<'a>(host_and_port: &'a str, default: &str) -> &'a str {
+    match host_and_port.rsplit_once(':') {
+        Some((host, _)) if host.starts_with('[') && !host.ends_with(']') => host_and_port,
+        Some((host, port)) if port == default => host,
+        _ => host_and_port,
     }
-    host_and_port.to_string()
 }
 
 pub struct SchemaCache {
     dir: PathBuf,
+    writer_id: u32,
+    tmp_counter: AtomicU64,
 }
 
 impl SchemaCache {
-    pub fn new(server_url: &str) -> CliResult<Self> {
-        let base = dirs::cache_dir()
-            .ok_or_else(|| CliError::msg("could not determine user cache directory"))?;
+    pub fn new(base: &Path, server_url: &str, writer_id: u32) -> Result<Self> {
         let server_hash = hash_b64(normalise_url(server_url).as_bytes());
-        let dir = base.join("stalwart-cli").join(server_hash);
+        let dir = base.join(CACHE_DIR_NAME).join(server_hash);
         fs::create_dir_all(&dir)?;
-        Ok(SchemaCache { dir })
+        Ok(SchemaCache::at(dir, writer_id))
+    }
+
+    fn at(dir: PathBuf, writer_id: u32) -> Self {
+        SchemaCache {
+            dir,
+            writer_id,
+            tmp_counter: AtomicU64::new(0),
+        }
     }
 
     pub fn latest_hash(&self) -> Option<String> {
-        fs::read_to_string(self.dir.join("latest"))
+        fs::read_to_string(self.dir.join(LATEST))
             .ok()
             .map(|s| s.trim().to_string())
     }
 
     pub fn read(&self, hash: &str) -> Option<Vec<u8>> {
-        fs::read(self.file_for(hash)).ok()
+        fs::read(self.file_for_hash(hash)).ok()
     }
 
     pub fn any_cached(&self) -> Option<(String, Vec<u8>)> {
@@ -89,32 +93,47 @@ impl SchemaCache {
         Some((hash, bytes))
     }
 
-    pub fn write(&self, hash: &str, bytes: &[u8]) -> CliResult<()> {
-        let target = self.file_for(hash);
-        let tmp = with_suffix(&target, &tmp_suffix());
-        write_then_rename(&tmp, &target, bytes)?;
+    pub fn write(&self, hash: &str, bytes: &[u8]) -> Result<()> {
+        let target = self.file_for_hash(hash);
+        write_then_rename(&self.tmp_path(&target), &target, bytes)?;
 
-        let latest = self.dir.join("latest");
-        let latest_tmp = self.dir.join(format!("latest{}", tmp_suffix()));
-        write_then_rename(&latest_tmp, &latest, hash.as_bytes())?;
-        Ok(())
+        let latest = self.dir.join(LATEST);
+        write_then_rename(&self.tmp_path(&latest), &latest, hash.as_bytes())
     }
 
     pub fn file_for_hash(&self, hash: &str) -> PathBuf {
-        self.file_for(hash)
+        let mut name =
+            String::with_capacity(SCHEMA_FILE_PREFIX.len() + hash.len() + SCHEMA_FILE_SUFFIX.len());
+        name.push_str(SCHEMA_FILE_PREFIX);
+        name.push_str(hash);
+        name.push_str(SCHEMA_FILE_SUFFIX);
+        self.dir.join(name)
     }
 
     pub fn invalidate(&self, hash: &str) {
-        let _ = fs::remove_file(self.dir.join("latest"));
-        let _ = fs::remove_file(self.file_for(hash));
+        let _ = fs::remove_file(self.dir.join(LATEST));
+        let _ = fs::remove_file(self.file_for_hash(hash));
     }
 
-    fn file_for(&self, hash: &str) -> PathBuf {
-        self.dir.join(format!("schema-{}.json", hash))
+    fn tmp_path(&self, target: &Path) -> PathBuf {
+        tmp_path(target, self.writer_id, &self.tmp_counter)
     }
 }
 
-fn write_then_rename(tmp: &Path, target: &Path, bytes: &[u8]) -> CliResult<()> {
+pub fn tmp_path(target: &Path, writer_id: u32, counter: &AtomicU64) -> PathBuf {
+    let mut suffix = String::with_capacity(32);
+    let _ = write!(
+        suffix,
+        ".tmp.{}.{}",
+        writer_id,
+        counter.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut path = target.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn write_then_rename(tmp: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
     if let Err(e) = fs::write(tmp, bytes) {
         let _ = fs::remove_file(tmp);
         return Err(e.into());
@@ -126,106 +145,7 @@ fn write_then_rename(tmp: &Path, target: &Path, bytes: &[u8]) -> CliResult<()> {
     Ok(())
 }
 
-fn tmp_suffix() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    format!(
-        ".tmp.{}.{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
-    let mut s = p.as_os_str().to_os_string();
-    s.push(suffix);
-    PathBuf::from(s)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn temp_names_are_unique_per_writer() {
-        let a = tmp_suffix();
-        let b = tmp_suffix();
-        assert_ne!(
-            a, b,
-            "two writers sharing a temp path can rename a half-written file into place"
-        );
-        assert!(a.contains(&std::process::id().to_string()));
-    }
-
-    #[test]
-    fn concurrent_writes_leave_a_complete_file() {
-        let dir = std::env::temp_dir().join(format!("stalwart-cli-cache-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let cache = SchemaCache { dir: dir.clone() };
-
-        let bytes = vec![b'x'; 512 * 1024];
-        std::thread::scope(|s| {
-            for _ in 0..8 {
-                let cache = &cache;
-                let bytes = &bytes;
-                s.spawn(move || cache.write("h", bytes).unwrap());
-            }
-        });
-
-        assert_eq!(
-            cache.read("h").as_deref(),
-            Some(bytes.as_slice()),
-            "a reader must never observe a partially written schema"
-        );
-        assert_eq!(cache.latest_hash().as_deref(), Some("h"));
-        let leftovers: Vec<_> = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "temp files must not be left behind");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn normalise_lowercases_scheme_and_host() {
-        assert_eq!(
-            normalise_url("HTTPS://Mail.Example.com/"),
-            "https://mail.example.com"
-        );
-    }
-
-    #[test]
-    fn normalise_strips_default_https_port() {
-        assert_eq!(
-            normalise_url("https://mail.example.com:443"),
-            "https://mail.example.com"
-        );
-    }
-
-    #[test]
-    fn normalise_keeps_non_default_port() {
-        assert_eq!(
-            normalise_url("http://localhost:8080/"),
-            "http://localhost:8080"
-        );
-    }
-
-    #[test]
-    fn normalise_drops_path_and_query() {
-        assert_eq!(
-            normalise_url("https://mail.example.com/foo/bar?x=1#y"),
-            "https://mail.example.com"
-        );
-    }
-
-    #[test]
-    fn hash_b64_produces_43_chars() {
-        let h = hash_b64(b"hello");
-        assert_eq!(h.len(), 43);
-        assert!(
-            h.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        );
-    }
-}
+#[cfg(all(test, stalwart_cli_tests))]
+#[rustfmt::skip]
+#[path = "../../../cli-tests/unit/src/jmap/cache/tests.rs"]
+mod tests;

@@ -1,7 +1,7 @@
 [package]
 name = "stalwart-cli"
 description = "Stalwart CLI"
-version = "1.0.14"
+version = "2.0.0"
 authors = ["Stalwart Labs LLC <hello@stalw.art>"]
 license = "AGPL-3.0-only OR LicenseRef-SEL"
 repository = "https://github.com/stalwartlabs/cli"
@@ -18,21 +18,35 @@ eula = false
 [dependencies]
 ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.102"
+bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 dirs = "7"
 flate2 = "1.1.9"
+form_urlencoded = "1"
+hmac = "0.13"
+hashify = "0.3"
+indexmap = { version = "2", features = ["serde"] }
 is-terminal = "0.4.17"
+log = "0.4"
+percent-encoding = "2"
+malevich = { version = "=1.25.0", default-features = false, features = ["ratatui"] }
 encodify = "1.0"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls", "json"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 rpassword = "7.5"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.149", features = ["preserve_order"] }
+serde_json = { version = "1.0.149", features = ["preserve_order", "raw_value"] }
+sha1 = "0.11"
 sha2 = "0.11"
 thiserror = "2"
+terminal_size = "0.4"
+tui-big-text = "0.8"
+unicode-width = "0.2"
+qrcode = { version = "0.14", default-features = false }
+getrandom = "0.3"
 
-[dev-dependencies]
-testcontainers = { version = "0.28", features = ["blocking"] }
-rcgen = "0.14"
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(stalwart_cli_tests)'] }
 
 [[bin]]
 name = "stalwart-cli"

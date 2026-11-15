@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [2.0.0] - 2026-11-16
+
+### Added
+- Interactive console: `stalwart-cli tui`, or `stalwart-cli` with no arguments in a terminal (`--sidebar`, `--theme`).
+- `--auth device` signs in with the OAuth device flow (`--client-id` names a pre-registered client) and stores a refreshable session per server.
+- `logout` revokes and forgets the stored session for `--url`; `--user` picks which stored account to sign out.
+- `--auth basic` selects basic auth only; `STALWART_AUTH` and `STALWART_CLIENT_ID` set `--auth` and `--client-id`.
+- A stored session for `--url` is reused without any credential flags.
+- Expressions (`match`/`else` settings) have their own TUI editor: numbered if/then rules, multi-line conditions, add/remove/reorder, server parse errors shown on the rule they name; `get` and detail views print them as `if`/`then`/`else` lines.
+- Without `--auth` or credentials, a terminal run with no stored session signs in with the device flow when the server supports it.
+
+### Changed
+- Internal API and module reorganization.
+- Human-readable output uses proper case, words instead of wire names, and consistent colours.
+- `TERM=dumb` disables colour, and `--no-color`/`NO_COLOR` now also apply to the help screens.
+- `upsert` and `reconcile` send their updates in `maxObjectsInSet` batches, reporting one progress line per batch instead of one request and line per object.
+- The root help screen shows the Stalwart logo, sized to the terminal width.
+- `delete` prints `✓ Deleted <Object> <id>` and `✗ <Object> <id>: <reason>` per id.
+- `apply` `Plan:` and `Done:` lines list only non-zero counts.
+- `apply` op lines read `✓ Created Domain (3 objects)`, `✗ Update Domain failed: ...` and `✓ Removed Domain not in the plan (2 objects)`.
+- An `apply` set error prints its details on indented lines like `delete`, instead of one line joined with `|` and a nested `error:` tag.
+- `apply --dry-run` prints `Dry run: no changes will be made.`, and `--progress` batch lines are capitalised.
+- `snapshot` progress reads `Snapshot: ...`, `Fetching <Object>…`, `N objects fetched` and `✓ Snapshot complete`.
+- `describe` marks `(singleton)`, tags fields `(optional)`, `(create-only)` or `(read-only)`, uses worded types, and lists variants with their own field sections.
+- `get` starts with a `<Object> <label> (id <id>)` heading.
+- Table cells for object lists and object maps show their item names (or `N items`) instead of `<list:N>` and `<map:N>`.
+- Running with no arguments off a terminal prints help to stdout and exits 0 (v1 printed it to stderr and exited 2).
+- HTTP 402 is reported as `multi-factor authentication required`, and an expired OAuth session as `session expired; sign in again`.
+- The schema-cache fallback warning reads `using the cached schema, refreshing it failed: ...`.
+- `warning:` and `error:` tags are coloured by whether stderr is a terminal, and honour `--no-color`, `NO_COLOR` and `TERM=dumb`.
+- The missing-credentials error also suggests `--auth device`, and says why device sign-in is unavailable when it was tried.
+
+### Fixed
+- `query --fields` no longer skips or repeats objects across pages when the server returns `get` results in a different order.
+- A non-ASCII schema colour no longer crashes rendering.
+- A malformed `set` error from the server is reported instead of being silently replaced, and an unknown error type is shown by its own name.
+- A truncated coloured table cell no longer bleeds its colour into the following columns.
+- A non-string id in a `query` response is reported instead of silently dropped.
+- `--where` splits at the first operator, so `name=a>b` filters `name` on `a>b`.
+- `apply` rejects two entries whose match keys differ only in set member order, instead of creating both.
+- Fields of objects without a form are printed in declaration order instead of a random order.
+- `apply` no longer under-counts destroys when a destroy batch fails partway.
+- `apply` counts the objects a partly rejected create or update batch did change, and a later `reconcile` no longer destroys objects that an earlier failed op matched or created.
+- Tables no longer pad rows with trailing spaces, and nested tables align non-ASCII cells.
+- An empty `NO_COLOR` no longer disables colour.
+- `query`, `update` and `delete` help describe the `<OBJECT>` argument.
+
 ## [1.0.14] - 2026-10-25
 
 ### Added
