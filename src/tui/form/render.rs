@@ -181,7 +181,7 @@ fn render_map(map: &mut MapView, frame: &mut Frame, area: Rect, cx: &FormFrame<'
         lines.push(Line::styled(" No entries · a to add one", theme.muted()));
     }
     let header = lines.len();
-    for (index, ((_, value), key)) in map.entries.iter().zip(&keys).enumerate() {
+    for (index, ((name, value), key)) in map.entries.iter().zip(&keys).enumerate() {
         let focused = index == cursor && !new_key;
         let mut spans = vec![
             Span::styled(
@@ -210,7 +210,7 @@ fn render_map(map: &mut MapView, frame: &mut Frame, area: Rect, cx: &FormFrame<'
             continue;
         }
         let mut styled = Styled::default();
-        match (value, &map.value_type) {
+        match (value, map.entry_type(cx.schema, name).as_ref()) {
             (Value::Object(item), FieldType::Object { object_name, .. }) => {
                 styled.plain(item_summary(cx.schema, object_name, item).unwrap_or("{…}"));
             }

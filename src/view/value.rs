@@ -144,18 +144,34 @@ impl<'a> ValueFormatter<'a> {
             }
             self.scalar_key(out, key_class, key);
             out.plain(" → ");
-            self.map_value(out, class, item);
+            self.map_value(out, key_class, key, class, item);
         }
     }
 
-    fn map_value(&self, out: &mut Styled, class: &MapValueType, value: &Value) {
+    fn map_value(
+        &self,
+        out: &mut Styled,
+        key_class: &ScalarType,
+        key: &str,
+        class: &MapValueType,
+        value: &Value,
+    ) {
         if value.is_null() {
             Self::none(out);
             return;
         }
         match class {
             MapValueType::String { .. } => Self::string(out, value),
-            MapValueType::Number { format, .. } => Self::number(out, value, format),
+            MapValueType::Number { format, .. } => {
+                let variant_format = match key_class {
+                    ScalarType::Enum { enum_name } => self
+                        .schema
+                        .enum_variant(enum_name, key)
+                        .and_then(|variant| variant.value_format),
+                    _ => None,
+                };
+                Self::number(out, value, &variant_format.unwrap_or(*format))
+            }
             MapValueType::Enum { enum_name } => self.enum_value(out, enum_name, value),
             MapValueType::Object { .. } => out.plain("<object>"),
         }

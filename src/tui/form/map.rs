@@ -11,6 +11,7 @@ use crate::tui::form::nested::{AT_LEAST, AT_MOST, Frame, READ_ONLY, Slot, embedd
 use crate::tui::form::view::{EditAction, FormAction, FormView, Pick, PickAt, PickKind};
 use ratatui::crossterm::event::KeyEvent;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 const DUPLICATE: &str = "This key is already in the map";
 const EMPTY_KEY: &str = "Enter a key";
@@ -79,6 +80,25 @@ impl MapView {
             max,
             rules,
         }
+    }
+
+    pub fn entry_type(&self, schema: &Schema, key: &str) -> Cow<'_, FieldType> {
+        if let FieldType::Enum { enum_name, .. } = &self.key_type
+            && let FieldType::Number {
+                min, max, nullable, ..
+            } = &self.value_type
+            && let Some(format) = schema
+                .enum_variant(enum_name, key)
+                .and_then(|variant| variant.value_format)
+        {
+            return Cow::Owned(FieldType::Number {
+                format,
+                min: min.clone(),
+                max: max.clone(),
+                nullable: *nullable,
+            });
+        }
+        Cow::Borrowed(&self.value_type)
     }
 
     pub fn editing(&self) -> Option<&MapEditing> {
@@ -189,8 +209,8 @@ impl MapView {
                     multi: false,
                 },
             }),
-            typ => {
-                if let Some(kind) = Kind::of_field(typ) {
+            _ => {
+                if let Some(kind) = Kind::of_field(&self.entry_type(schema, key)) {
                     self.editing = Some(MapEditing::Value(Inline::open(kind, Some(value))));
                 }
                 MapStep::None

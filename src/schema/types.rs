@@ -622,6 +622,8 @@ pub struct EnumVariant {
     pub explanation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_format: Option<NumberFormat>,
 }
 
 #[cfg(all(test, stalwart_cli_tests))]
