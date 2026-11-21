@@ -193,6 +193,7 @@ set_error_types! {
     AlreadyExists => "alreadyExists", "Already exists",
     InvalidScript => "invalidScript", "Invalid script",
     ScriptIsActive => "scriptIsActive", "Script is active",
+    SieveIsActive => "sieveIsActive", "Script is active",
     AddressBookHasContents => "addressBookHasContents", "Address book has contents",
     NodeHasChildren => "nodeHasChildren", "Node has children",
     CalendarHasEvent => "calendarHasEvent", "Calendar has events",

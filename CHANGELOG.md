@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file. This projec
 ### Changed
 - Map values use the value format their key declares in the schema: the maximum disk space quota is shown with units in `get`, `query` and the TUI, and edited with the size editor in the TUI.
 
+### Fixed
+- Errors with the RFC 9661 `sieveIsActive` SetError type are recognised.
+
 ## [2.0.0] - 2026-11-16
 
 ### Added
